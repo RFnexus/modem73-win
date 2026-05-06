@@ -7,9 +7,17 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: ''
-        required: false
+        description: 'Release version (e.g. 0.1.0). A tag v<version> will be created.'
+        required: true
         default: '0.0.0-dev'
+      publish:
+        description: 'Publish a GitHub Release for this version'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write 
 
 jobs:
   build:
@@ -260,11 +268,18 @@ jobs:
             modem73_*.deb.sha512
 
       - name: Attach to release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        if: |
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
         uses: softprops/action-gh-release@v2
         with:
+          # On tag push, action-gh-release uses the ref's tag automatically.
+          # On workflow_dispatch we set it explicitly from the version input.
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
+          name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
           files: |
             modem73_*.deb
             modem73_*.deb.sha256
             modem73_*.deb.sha512
           generate_release_notes: true
+          fail_on_unmatched_files: true
