@@ -18,34 +18,6 @@ MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol))
 ### Windows?
 Windows fork by SP5LOT https://github.com/SP5LOT/modem73 (out of date)
 
-
-
-#### Install from .deb (x86_64 / arm64 / armhf)                                                                                                                                              
-                                                                                                                                                                                             
-Prebuilt packages are attached to each release. Pick the one that matches your CPU:                                                                                                          
-                                                                                                                                                                                             
-```                                                                                                                                                                                  
-# x86_64 (most desktops/laptops)                                                                                                                                                  
-wget https://github.com/RFnexus/modem73/releases/latest/download/modem73_amd64.deb                                                                                                           
-sudo apt install ./modem73_amd64.deb                                                                                                                                                         
-                                                                                                                                                                                             
-# arm64 (Raspberry Pi 4/5 on 64-bit OS. Pi Zero 2 on 64-bit OS,  and most other SBCs)                                                                                                                                    
-wget https://github.com/RFnexus/modem73/releases/latest/download/modem73_arm64.deb                                                                                                           
-sudo apt install ./modem73_arm64.deb                                                                                                                                                         
-                
-# armhf (32-bit Raspberry Pi OS, Pi 2/3, ARmbian Xiegu X6100)                                                                                                                                  
-wget https://github.com/RFnexus/modem73/releases/latest/download/modem73_armhf.deb
-sudo apt install ./modem73_armhf.deb                                                                                                                                          
-```                                                                                                                                                                                  
-Not sure which arch you're on? Run dpkg --print-architecture.                                                                                                                                
-                                                                                                                                                                                             
-Then verify the download:                                                                                                                                                  
-```     
-wget https://github.com/RFnexus/modem73/releases/latest/download/modem73_amd64.deb.sha256                                                                                                    
-sha256sum -c modem73_amd64.deb.sha256
-```
-and run `modem73` :)
-
 ## Building from source
 
 ### Linux
