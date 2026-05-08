@@ -65,6 +65,7 @@ Stats switch between OFDM and MFSK decoder based on active `modem_type`.
 | `p_persistence` | int | P-persistence value (0-255) |
 | `slot_time_ms` | int | CSMA slot time (ms) |
 | `tx_blanking_enabled` | bool | Suppress decoder during TX |
+| `fragmentation_enabled` | bool | Enable packet fragmentation/reassembly |
 
 ---
 

@@ -1775,6 +1775,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
+                cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
 
                 return j;
             };
@@ -1807,6 +1808,8 @@ int main(int argc, char** argv) {
                     new_config.slot_time_ms = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_blanking_enabled")) && cJSON_IsBool(item))
                     new_config.tx_blanking_enabled = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "fragmentation_enabled")) && cJSON_IsBool(item))
+                    new_config.fragmentation_enabled = cJSON_IsTrue(item);
 
                 tnc.update_config(new_config);
 
@@ -1823,6 +1826,7 @@ int main(int argc, char** argv) {
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
                     g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
+                    g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
 
                     // Map modulation string back to index
                     for (size_t i = 0; i < MODULATION_OPTIONS.size(); i++) {
