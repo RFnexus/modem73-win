@@ -7,12 +7,14 @@
   </picture>
 </p>
 
-MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol)) TNC frontend for the [aicodix](https://github.com/aicodix/modem) OFDM modem. 
+MODEM73 is a [KISS](https://en.wikipedia.org/wiki/KISS_(amateur_radio_protocol)) frontend for the [aicodix](https://github.com/aicodix/modem) OFDM modem that works with any HF/VHF/UHF radio capable of working with 2400 Hz of bandwidth
 
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
-
-
+<p>
+<img width="546" height="423" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
+<img width="276.5" height="199" alt="image" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" />
+</p>
 
 ## Installation
 
