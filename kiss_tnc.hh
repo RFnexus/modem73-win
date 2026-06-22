@@ -83,6 +83,7 @@ struct TNCConfig {
 #ifdef WITH_CM108
     // CM108 PTT settings
     int cm108_gpio = 3;
+    std::string cm108_device;   // empty = first compatible device, else serial or USB path
 #endif
     
     // PTT timing 

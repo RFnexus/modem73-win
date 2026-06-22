@@ -221,7 +221,7 @@ public:
 #ifdef WITH_CM108
         } else if (config_.ptt_type == PTTType::CM108) {
             cm108_ptt_ = std::make_unique<CM108PTT>();
-            cm108_ptt_->open(config_.cm108_gpio);
+            cm108_ptt_->open(config_.cm108_gpio, config_.cm108_device);
 #endif
         } else {
             dummy_ptt_ = std::make_unique<DummyPTT>();
@@ -1253,6 +1253,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "com_invert_rts") && take(key)) config.com_invert_rts = atoi(value) != 0;
 #ifdef WITH_CM108
         else if (!strcmp(key, "cm108_gpio") && take(key)) config.cm108_gpio = atoi(value);
+        else if (!strcmp(key, "cm108_device") && take(key)) config.cm108_device = value;
 #endif
         else if (!strcmp(key, "port") && take(key)) config.port = atoi(value);
     }
@@ -1294,6 +1295,9 @@ void print_help(const char* prog) {
               << "  --vox-tail MS           VOX tail time in ms (default: 100)\n"
 #ifdef WITH_CM108
               << "  --cm108-gpio N          CM108 GPIO pin for PTT (default: 3)\n"
+              << "  --cm108-device SPEC     CM108 device to use: serial or USB path\n"
+              << "                          (default: first compatible device)\n"
+              << "  --list-cm108            List CM108-compatible devices and exit\n"
 #endif
               << "  --ptt-delay MS          PTT delay before TX (default: 50)\n"
               << "  --ptt-tail MS           PTT tail after TX (default: 50)\n"
@@ -1346,6 +1350,22 @@ int main(int argc, char** argv) {
                 std::cout << "  " << dev.second << "\n";
             }
             return 0;
+#ifdef WITH_CM108
+        } else if (arg == "--list-cm108") {
+            auto devices = CM108PTT::enumerate();
+            if (devices.empty()) {
+                std::cout << "No CM108-compatible devices found\n";
+            } else {
+                std::cout << "CM108-compatible devices:\n";
+                for (const auto& d : devices) {
+                    std::cout << "  " << d.chip;
+                    if (!d.product.empty()) std::cout << " [" << d.product << "]";
+                    std::cout << "\n    serial: " << (d.serial.empty() ? "(none)" : d.serial)
+                              << "\n    path:   " << d.path << "\n";
+                }
+            }
+            return 0;
+#endif
         } else if (arg == "-v" || arg == "--verbose") {
             g_verbose = true;
         } else if (arg == "-h" || arg == "--headless") {
@@ -1483,6 +1503,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--cm108-gpio" && i + 1 < argc) {
             config.cm108_gpio = std::atoi(argv[++i]);
             cli_set.insert("cm108_gpio");
+        } else if (arg == "--cm108-device" && i + 1 < argc) {
+            config.cm108_device = argv[++i];
+            cli_set.insert("cm108_device");
 #endif
         } else if (arg == "--ptt-delay" && i + 1 < argc) {
             config.ptt_delay_ms = std::atoi(argv[++i]);
