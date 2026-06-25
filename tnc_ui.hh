@@ -26,6 +26,9 @@
 
 #include "kiss_tnc.hh"
 #include "phy/mfsk_modem.hh"
+#ifdef WITH_CM108
+#include "cm108_ptt.hh"
+#endif
 
 constexpr size_t MAX_LOG_ENTRIES = 500;
 
@@ -101,6 +104,7 @@ struct TNCUIState {
 #ifdef WITH_CM108
     // CM108 PTT settings (PTT type 4)
     int cm108_gpio = 3;  // GPIO pin to use for PTT, default 3
+    std::string cm108_device;  // empty = first compatible device, else serial or USB path
 #endif
 
     int mtu_bytes = 0;
@@ -502,6 +506,7 @@ struct TNCUIState {
 #ifdef WITH_CM108
         fprintf(f, "# CM108 PTT\n");
         fprintf(f, "cm108_gpio=%d\n", cm108_gpio);
+        fprintf(f, "cm108_device=%s\n", cm108_device.c_str());
 #endif
         fprintf(f, "# Network\n");
         fprintf(f, "port=%d\n", port);
@@ -558,6 +563,7 @@ struct TNCUIState {
                 else if (strcmp(key, "com_invert_rts") == 0) com_invert_rts = atoi(value) != 0;
 #ifdef WITH_CM108
                 else if (strcmp(key, "cm108_gpio") == 0) cm108_gpio = atoi(value);
+                else if (strcmp(key, "cm108_device") == 0) cm108_device = value;
 #endif
                 else if (strcmp(key, "port") == 0) port = atoi(value);
                 else if (strcmp(key, "random_data_size") == 0) random_data_size = atoi(value);
@@ -877,6 +883,7 @@ private:
         FIELD_COM_INVERT,
 #ifdef WITH_CM108
         FIELD_CM108_GPIO,
+        FIELD_CM108_DEVICE,
 #endif
         FIELD_NET_PORT,
         FIELD_PRESET,      
@@ -1044,8 +1051,13 @@ private:
                     } else if (current_field_ == FIELD_AUDIO_OUTPUT) {
 
 
-                        show_device_select_dialog(false); 
+                        show_device_select_dialog(false);
 
+#ifdef WITH_CM108
+                    } else if (current_field_ == FIELD_CM108_DEVICE) {
+
+                        show_cm108_device_dialog();
+#endif
 
                     } else if (current_field_ == FIELD_PRESET) {
 
@@ -1387,7 +1399,7 @@ private:
         }
 #ifdef WITH_CM108
         if (state_.ptt_type_index != 4) {  // not CM108
-            if (field == FIELD_CM108_GPIO) {
+            if (field == FIELD_CM108_GPIO || field == FIELD_CM108_DEVICE) {
                 return true;
             }
         }
@@ -1649,7 +1661,161 @@ private:
         
         nodelay(stdscr, TRUE);
     }
-    
+
+#ifdef WITH_CM108
+    void show_cm108_device_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        auto devices = CM108PTT::enumerate();
+
+
+
+        std::vector<std::string> values;
+        std::vector<std::string> descriptions;
+        
+        values.push_back("");
+        descriptions.push_back("Auto (first compatible device)");
+        for (const auto& d : devices) {
+            std::string desc = d.chip;
+            if (!d.product.empty()) desc += " - " + d.product;
+            if (!d.serial.empty()) {
+                values.push_back(d.serial);
+                desc += " (sn " + d.serial + ")";
+            } else {
+                values.push_back(d.path);
+                desc += " (" + d.path + ")";
+            }
+            descriptions.push_back(desc);
+        }
+
+        int selection = 0;
+        for (int i = 1; i < (int)values.size(); i++) {
+            if (values[i] == state_.cm108_device) { selection = i; break; }
+        }
+
+
+
+
+
+        if (selection == 0 && !state_.cm108_device.empty()) {
+            values.push_back(state_.cm108_device);
+            descriptions.push_back(state_.cm108_device + " (not connected)");
+            selection = (int)values.size() - 1; 
+        }
+
+
+        int dialog_w = std::min(cols - 4, 58);
+        int max_visible = std::min((int)values.size(), 12);
+        int dialog_h = max_visible + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        int scroll_offset = 0;
+        if (selection >= max_visible) {
+            scroll_offset = selection - max_visible + 1;
+        }
+
+
+        nodelay(stdscr, FALSE);
+
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            const char* title = " CM108 Device ";
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dialog_y, dialog_x + (dialog_w - strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            int visible_count = std::min((int)values.size() - scroll_offset, max_visible);
+            for (int i = 0; i < visible_count; i++) {
+                int dev_idx = scroll_offset + i;
+                int y = dialog_y + 1 + i;
+
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+
+                if (dev_idx == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+
+                std::string desc = descriptions[dev_idx];
+                int max_len = dialog_w - 4;
+                if ((int)desc.length() > max_len) {
+                    desc = desc.substr(0, max_len - 2) + "..";
+                }
+                addstr(desc.c_str());
+
+                if (dev_idx == selection) {
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+
+            if (scroll_offset > 0) {
+                attron(A_DIM);
+                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
+                attroff(A_DIM);
+            }
+            if (scroll_offset + max_visible < (int)values.size()) {
+                attron(A_DIM);
+                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
+                attroff(A_DIM);
+            }
+
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 15, "(needs restart)");
+            attroff(A_DIM);
+
+            refresh();
+
+            int ch = getch();
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection >= 0 && selection < (int)values.size()) {
+                    state_.cm108_device = values[selection];
+                    state_.add_log("CM108: " + descriptions[selection] + " (restart to apply)");
+                    apply_settings();
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) {
+                    selection--;
+                    if (selection < scroll_offset) scroll_offset = selection;
+                }
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < (int)values.size() - 1) {
+                    selection++;
+                    if (selection >= scroll_offset + max_visible) {
+                        scroll_offset = selection - max_visible + 1;
+                    }
+                }
+            } else if (ch == KEY_PPAGE) {
+                selection = std::max(0, selection - max_visible);
+                scroll_offset = std::max(0, scroll_offset - max_visible);
+            } else if (ch == KEY_NPAGE) {
+                selection = std::min((int)values.size() - 1, selection + max_visible);
+                if (selection >= scroll_offset + max_visible) {
+                    scroll_offset = selection - max_visible + 1;
+                }
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+    }
+#endif
+
     void save_preset_dialog() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
@@ -2402,9 +2568,11 @@ private:
                 row++;
             }
 #ifdef WITH_CM108
-            // CM108 field, only when CM108 selected as PTT
+            // CM108 fields, only when CM108 selected as PTT
             if (state_.ptt_type_index == 4) {
                 if (field == FIELD_CM108_GPIO) return row;
+                row++;
+                if (field == FIELD_CM108_DEVICE) return row;
                 row++;
             }
 #endif
@@ -2674,6 +2842,16 @@ private:
                 char cm108_gpio_buf[32];
                 snprintf(cm108_gpio_buf, sizeof(cm108_gpio_buf), "%d", state_.cm108_gpio);
                 draw_field(dy, c1, c2, "GPIO Pin", FIELD_CM108_GPIO, cm108_gpio_buf, true);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                std::string dev_display = state_.cm108_device.empty() ? "Auto" : state_.cm108_device;
+                if (dev_display.length() > 12) {
+                    dev_display = dev_display.substr(0, 11) + "~";
+                }
+                draw_field(dy, c1, c2, "Device", FIELD_CM108_DEVICE, dev_display, true);
             }
             row++;
         }
