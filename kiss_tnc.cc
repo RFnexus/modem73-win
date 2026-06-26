@@ -1626,6 +1626,16 @@ int main(int argc, char** argv) {
                 config.com_invert_dtr = ui_state.com_invert_dtr;
                 config.com_invert_rts = ui_state.com_invert_rts;
 
+#ifdef WITH_CM108
+                // CM108 PTT settings
+
+                if (!cli_set.count("cm108_gpio"))
+                    config.cm108_gpio = ui_state.cm108_gpio;
+
+                if (!cli_set.count("cm108_device"))
+                    config.cm108_device = ui_state.cm108_device;
+                
+#endif
 
                 // Network settings
                 if (!cli_set.count("port"))
@@ -1674,6 +1684,11 @@ int main(int argc, char** argv) {
                 ui_state.com_ptt_line = config.com_ptt_line;
                 ui_state.com_invert_dtr = config.com_invert_dtr;
                 ui_state.com_invert_rts = config.com_invert_rts;
+#ifdef WITH_CM108
+                // CM108 PTT settings
+                ui_state.cm108_gpio = config.cm108_gpio;
+                ui_state.cm108_device = config.cm108_device;
+#endif
                 // Network settings
                 ui_state.port = config.port;
                 
