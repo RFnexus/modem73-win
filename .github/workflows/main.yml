@@ -1,4 +1,4 @@
-name: Build .deb packages
+name: Build packages
 
 on:
   push:
@@ -17,31 +17,157 @@ on:
         default: true
 
 permissions:
-  contents: write 
+  contents: write
 
 jobs:
-  build:
+  prep:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+          fi
+          V="$(printf '%s' "$V" | tr '-' '+')"
+          case "$V" in
+            [0-9]*) ;;
+            *) V="0.0.0+$V" ;;
+          esac
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "Building version ${V}"
+
+  build-deb:
+    needs: prep
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-24.04
+          - id: ubuntu-24.04
+            container: ubuntu:24.04
+            codename: noble
+            family: ubuntu
             arch: amd64
+            runner: ubuntu-24.04
             arch_flags: "-march=x86-64-v2"
             cross_triple: ""
-          - runner: ubuntu-24.04-arm
+          - id: ubuntu-24.04
+            container: ubuntu:24.04
+            codename: noble
+            family: ubuntu
             arch: arm64
+            runner: ubuntu-24.04-arm
             arch_flags: "-march=armv8-a"
             cross_triple: ""
-          - runner: ubuntu-24.04
+          - id: ubuntu-24.04
+            container: ubuntu:24.04
+            codename: noble
+            family: ubuntu
             arch: armhf
-            # Debian armhf baseline: ARMv7-A + VFPv3-D16 hardfloat.
+            runner: ubuntu-24.04
             arch_flags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
-            cross_triple: "arm-linux-gnueabihf"
-
-    runs-on: ${{ matrix.runner }}
+            cross_triple: arm-linux-gnueabihf
+          - id: ubuntu-22.04
+            container: ubuntu:22.04
+            codename: jammy
+            family: ubuntu
+            arch: amd64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cross_triple: ""
+          - id: ubuntu-22.04
+            container: ubuntu:22.04
+            codename: jammy
+            family: ubuntu
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cross_triple: ""
+          - id: ubuntu-22.04
+            container: ubuntu:22.04
+            codename: jammy
+            family: ubuntu
+            arch: armhf
+            runner: ubuntu-24.04
+            arch_flags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            cross_triple: arm-linux-gnueabihf
+          - id: debian-12
+            container: debian:12
+            codename: bookworm
+            family: debian
+            arch: amd64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cross_triple: ""
+          - id: debian-12
+            container: debian:12
+            codename: bookworm
+            family: debian
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cross_triple: ""
+          - id: debian-12
+            container: debian:12
+            codename: bookworm
+            family: debian
+            arch: armhf
+            runner: ubuntu-24.04
+            arch_flags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            cross_triple: arm-linux-gnueabihf
+          - id: debian-13
+            container: debian:13
+            codename: trixie
+            family: debian
+            arch: amd64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cross_triple: ""
+          - id: debian-13
+            container: debian:13
+            codename: trixie
+            family: debian
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cross_triple: ""
+          - id: debian-13
+            container: debian:13
+            codename: trixie
+            family: debian
+            arch: armhf
+            runner: ubuntu-24.04
+            arch_flags: "-march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            cross_triple: arm-linux-gnueabihf
+          - id: linuxmint-22
+            container: linuxmintd/mint22-amd64
+            codename: wilma
+            family: ubuntu
+            arch: amd64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cross_triple: ""
+          - id: armbian-x6100
+            container: debian:12
+            codename: bookworm
+            family: debian
+            arch: armhf
+            runner: ubuntu-24.04
+            arch_flags: "-march=armv7-a -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard"
+            cross_triple: arm-linux-gnueabihf
 
     steps:
+      - name: Bootstrap container
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - name: Checkout modem73
         uses: actions/checkout@v4
         with:
@@ -65,160 +191,77 @@ jobs:
           repository: aicodix/modem
           path: modem
 
-      - name: Enable armhf multiarch
+      - name: Enable armhf
         if: matrix.cross_triple
         run: |
-          sudo dpkg --add-architecture armhf
-          # Restrict the default Ubuntu mirror to amd64 (it has no armhf packages).
-          sudo sed -i 's|^Signed-By:|Architectures: amd64\nSigned-By:|' \
-            /etc/apt/sources.list.d/ubuntu.sources
-          # Add ports.ubuntu.com for armhf packages.
-          sudo tee /etc/apt/sources.list.d/ubuntu-armhf.sources >/dev/null <<'EOF'
-          Types: deb
-          URIs: http://ports.ubuntu.com/ubuntu-ports/
-          Suites: noble noble-updates noble-backports noble-security
-          Components: main restricted universe multiverse
-          Architectures: armhf
-          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          export DEBIAN_FRONTEND=noninteractive
+          if [ "${{ matrix.family }}" = "ubuntu" ]; then
+            if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+              sed -i 's|^Signed-By:|Architectures: amd64\nSigned-By:|' /etc/apt/sources.list.d/ubuntu.sources
+            fi
+            if [ -f /etc/apt/sources.list ]; then
+              sed -i 's|^deb http|deb [arch=amd64] http|g; s|^deb https|deb [arch=amd64] https|g' /etc/apt/sources.list
+            fi
+            cat > /etc/apt/sources.list.d/armhf-ports.list <<EOF
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ ${{ matrix.codename }} main restricted universe multiverse
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ ${{ matrix.codename }}-updates main restricted universe multiverse
+          deb [arch=armhf] http://ports.ubuntu.com/ubuntu-ports/ ${{ matrix.codename }}-security main restricted universe multiverse
           EOF
-
-      - name: Install build dependencies (native)
-        if: '!matrix.cross_triple'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential g++ libncurses-dev libhidapi-dev pkg-config \
-            ruby ruby-dev rubygems
-          sudo gem install --no-document fpm
-
-      - name: Install build dependencies (cross armhf)
-        if: matrix.cross_triple
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            crossbuild-essential-armhf \
-            libncurses-dev:armhf libhidapi-dev:armhf libtinfo-dev:armhf \
-            pkg-config \
-            ruby ruby-dev rubygems
-          sudo gem install --no-document fpm
-
-      - name: Determine version
-        id: ver
-        run: |
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            V="${GITHUB_REF_NAME#v}"
-          else
-            V="${{ github.event.inputs.version }}"
           fi
-          echo "version=${V}" >> "$GITHUB_OUTPUT"
-          echo "Building version ${V} for ${{ matrix.arch }}"
+          dpkg --add-architecture armhf
+          apt-get update
 
-      - name: Write packaging Makefile
-        working-directory: m73
+      - name: Install build dependencies
         run: |
-          cat > Makefile.deb <<'MAKEFILE_EOF'
-          CXX = g++
-          CC = gcc
-
-          ARCH_FLAGS ?= -O2
-          CXXFLAGS = -std=c++17 -O3 $(ARCH_FLAGS) -Wall -Wextra
-          LDFLAGS = -lpthread -ltinfo -lncurses -ldl -lm
-
-          PREFIX ?= /usr
-          DESTDIR ?=
-
-          AICODIX_DSP ?= ../dsp
-          AICODIX_CODE ?= ../code
-          MODEM_SRC ?= ../modem
-
-          INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
-
-          TARGET = modem73
-          SRCS = kiss_tnc.cc
-          HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh tnc_ui.hh control_port.hh
-          OBJS = deps/miniaudio.o deps/cJSON.o
-
-          UI_FLAGS = -DWITH_UI
-
-          HIDAPI_CFLAGS := $(shell pkg-config --cflags hidapi-hidraw 2>/dev/null || pkg-config --cflags hidapi-libusb 2>/dev/null || pkg-config --cflags hidapi 2>/dev/null)
-          HIDAPI_LIBS := $(shell pkg-config --libs hidapi-hidraw 2>/dev/null || pkg-config --libs hidapi-libusb 2>/dev/null || pkg-config --libs hidapi 2>/dev/null)
-
-          ifneq ($(HIDAPI_LIBS),)
-              CM108_FLAGS = -DWITH_CM108
-              CXXFLAGS += $(HIDAPI_CFLAGS)
-              LDFLAGS += $(HIDAPI_LIBS)
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          BASE="make pkg-config file ca-certificates ruby ruby-dev"
+          if [ -n "${{ matrix.cross_triple }}" ]; then
+            apt-get install -y --no-install-recommends $BASE build-essential \
+              crossbuild-essential-${{ matrix.arch }} \
+              libncurses-dev:${{ matrix.arch }} libtinfo-dev:${{ matrix.arch }} libhidapi-dev:${{ matrix.arch }}
           else
-              CM108_FLAGS =
-          endif
-
-          .PHONY: all clean install
-          all: $(TARGET)
-
-          deps/miniaudio.o: deps/miniaudio.c deps/miniaudio.h
-          	$(CC) -c -O2 -o $@ deps/miniaudio.c
-
-          deps/cJSON.o: deps/cJSON.c deps/cJSON.h
-          	$(CC) -c -O2 -o $@ deps/cJSON.c
-
-          $(TARGET): $(SRCS) $(HDRS) $(OBJS)
-          	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
-
-          clean:
-          	rm -f $(TARGET) $(OBJS)
-
-          install: $(TARGET)
-          	install -d $(DESTDIR)$(PREFIX)/bin
-          	install -m 755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/
-          ifneq ($(HIDAPI_LIBS),)
-          	@if [ -f misc/50-cm108-ptt.rules ]; then \
-          		install -d $(DESTDIR)/lib/udev/rules.d; \
-          		install -m 644 misc/50-cm108-ptt.rules $(DESTDIR)/lib/udev/rules.d/; \
-          	fi
-          endif
-          MAKEFILE_EOF
+            apt-get install -y --no-install-recommends $BASE build-essential g++ \
+              libncurses-dev libhidapi-dev
+          fi
+          gem install --no-document fpm
 
       - name: Build
         working-directory: m73
-        env: &build_env
+        env:
           CC: ${{ matrix.cross_triple && format('{0}-gcc', matrix.cross_triple) || 'gcc' }}
           CXX: ${{ matrix.cross_triple && format('{0}-g++', matrix.cross_triple) || 'g++' }}
-          # Force pkg-config to look only at the cross arch's .pc files. These
-          # also need to be set during `make install` so the install target's
-          # HIDAPI_LIBS check stays consistent with the build's.
           PKG_CONFIG_PATH: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig', matrix.cross_triple) || '' }}
           PKG_CONFIG_LIBDIR: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig:/usr/share/pkgconfig', matrix.cross_triple) || '' }}
         run: |
-          make -f Makefile.deb \
+          make -f packaging/Makefile.pkg \
                CC="$CC" CXX="$CXX" \
                ARCH_FLAGS="${{ matrix.arch_flags }}" \
-               AICODIX_DSP=../dsp \
-               AICODIX_CODE=../code \
-               MODEM_SRC=../modem \
+               AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem \
                -j"$(nproc)"
 
       - name: Stage install tree
         working-directory: m73
-        env: *build_env
+        env:
+          CC: ${{ matrix.cross_triple && format('{0}-gcc', matrix.cross_triple) || 'gcc' }}
+          CXX: ${{ matrix.cross_triple && format('{0}-g++', matrix.cross_triple) || 'g++' }}
+          PKG_CONFIG_PATH: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig', matrix.cross_triple) || '' }}
+          PKG_CONFIG_LIBDIR: ${{ matrix.cross_triple && format('/usr/lib/{0}/pkgconfig:/usr/share/pkgconfig', matrix.cross_triple) || '' }}
         run: |
-          make -f Makefile.deb install DESTDIR=../staging PREFIX=/usr
+          make -f packaging/Makefile.pkg install DESTDIR=../staging PREFIX=/usr
 
-      - name: Build .deb with fpm
+      - name: Build .deb
+        working-directory: m73
         run: |
-          # Only include lib/ in the package if the udev rules actually got
-          # installed there (i.e. CM108/hidapi support was enabled).
           PATHS="usr"
-          if [ -d staging/lib ]; then
+          HIDAPI_DEP=""
+          if [ -d ../staging/lib ]; then
             PATHS="$PATHS lib"
             HIDAPI_DEP="-d libhidapi-hidraw0"
-          else
-            HIDAPI_DEP=""
-            echo "Note: built without CM108 support — libhidapi-hidraw0 dep omitted."
           fi
-          # ncurses/tinfo went through the time_t-64 transition in 2024 — accept
-          # either name so the package installs on pre- and post-t64 systems.
           fpm -s dir -t deb \
             -n modem73 \
-            -v "${{ steps.ver.outputs.version }}" \
+            -v "${{ needs.prep.outputs.version }}" \
             -a "${{ matrix.arch }}" \
             --description "KISS TNC frontend for the aicodix OFDM modem." \
             --url "https://github.com/${{ github.repository }}" \
@@ -230,56 +273,264 @@ jobs:
             -d 'libtinfo6 | libtinfo6t64' \
             $HIDAPI_DEP \
             --deb-no-default-config-files \
-            -C staging \
-            -p "modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb" \
+            -C ../staging \
+            -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.deb" \
             $PATHS
 
-      - name: Generate checksums
+      - name: Checksums
         run: |
-          DEB="modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
-          sha256sum  "$DEB" | tee "${DEB}.sha256"
-          sha512sum  "$DEB" | tee "${DEB}.sha512"
+          for f in modem73_*.deb; do
+            sha256sum "$f" | tee "${f}.sha256"
+            sha512sum "$f" | tee "${f}.sha512"
+          done
 
-      - name: Smoke test the .deb (native)
+      - name: Smoke test
         if: '!matrix.cross_triple'
         run: |
-          sudo apt-get install -y "./modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
-          which modem73
+          export DEBIAN_FRONTEND=noninteractive
+          DEB="$(ls modem73_*.deb)"
+          apt-get install -y "./$DEB"
+          command -v modem73
           dpkg -L modem73 | head -30
-          # Binary should at least respond to --help without crashing.
-          modem73 --help >/dev/null 2>&1 || true
+          timeout 10 modem73 --help >/dev/null 2>&1 || true
 
-      - name: Inspect the .deb (cross)
+      - name: Inspect package
         if: matrix.cross_triple
         run: |
-          DEB="modem73_${{ steps.ver.outputs.version }}_${{ matrix.arch }}.deb"
+          DEB="$(ls modem73_*.deb)"
           dpkg-deb --info "$DEB"
           dpkg-deb --contents "$DEB"
-          # Confirm the binary is the right architecture.
           dpkg-deb --fsys-tarfile "$DEB" | tar -xO ./usr/bin/modem73 | file -
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: modem73_${{ matrix.arch }}
+          name: pkg-deb-${{ matrix.id }}-${{ matrix.arch }}
           path: |
             modem73_*.deb
             modem73_*.deb.sha256
             modem73_*.deb.sha512
 
+  build-rpm:
+    needs: prep
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: fedora-41
+            container: fedora:41
+            family: fedora
+            arch: x86_64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cc: gcc
+            cxx: g++
+            dep_ncurses: ncurses-libs
+            dep_cxx: libstdc++
+            dep_hidapi: hidapi
+          - id: fedora-41
+            container: fedora:41
+            family: fedora
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cc: gcc
+            cxx: g++
+            dep_ncurses: ncurses-libs
+            dep_cxx: libstdc++
+            dep_hidapi: hidapi
+          - id: fedora-42
+            container: fedora:42
+            family: fedora
+            arch: x86_64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cc: gcc
+            cxx: g++
+            dep_ncurses: ncurses-libs
+            dep_cxx: libstdc++
+            dep_hidapi: hidapi
+          - id: fedora-42
+            container: fedora:42
+            family: fedora
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cc: gcc
+            cxx: g++
+            dep_ncurses: ncurses-libs
+            dep_cxx: libstdc++
+            dep_hidapi: hidapi
+          - id: opensuse-leap-15.6
+            container: opensuse/leap:15.6
+            family: suse
+            arch: x86_64
+            runner: ubuntu-24.04
+            arch_flags: "-march=x86-64-v2"
+            cc: gcc-13
+            cxx: g++-13
+            dep_ncurses: libncurses6
+            dep_cxx: libstdc++6
+            dep_hidapi: libhidapi-hidraw0
+          - id: opensuse-leap-15.6
+            container: opensuse/leap:15.6
+            family: suse
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+            arch_flags: "-march=armv8-a"
+            cc: gcc-13
+            cxx: g++-13
+            dep_ncurses: libncurses6
+            dep_cxx: libstdc++6
+            dep_hidapi: libhidapi-hidraw0
+
+    steps:
+      - name: Bootstrap container
+        run: |
+          if [ "${{ matrix.family }}" = "fedora" ]; then
+            dnf -y install git ca-certificates tar gzip
+          else
+            zypper -n install git ca-certificates tar gzip
+          fi
+
+      - name: Checkout modem73
+        uses: actions/checkout@v4
+        with:
+          path: m73
+
+      - name: Checkout aicodix/dsp
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/dsp
+          path: dsp
+
+      - name: Checkout aicodix/code
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/code
+          path: code
+
+      - name: Checkout aicodix/modem
+        uses: actions/checkout@v4
+        with:
+          repository: aicodix/modem
+          path: modem
+
+      - name: Install build dependencies
+        run: |
+          if [ "${{ matrix.family }}" = "fedora" ]; then
+            dnf -y install gcc gcc-c++ make pkgconf-pkg-config ncurses-devel \
+              rpm-build redhat-rpm-config ruby ruby-devel
+            dnf -y install hidapi-devel || true
+          else
+            zypper -n --gpg-auto-import-keys refresh || true
+            zypper -n install --force-resolution --oldpackage \
+              gcc gcc-c++ gcc13 gcc13-c++ make pkg-config ncurses-devel \
+              rpm-build ruby ruby-devel
+            zypper -n install --force-resolution --oldpackage libhidapi-devel || true
+          fi
+          gem install --no-document --bindir /usr/local/bin fpm
+          echo /usr/local/bin >> "$GITHUB_PATH"
+
+      - name: Build
+        working-directory: m73
+        run: |
+          make -f packaging/Makefile.pkg \
+               CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}" \
+               ARCH_FLAGS="${{ matrix.arch_flags }}" \
+               AICODIX_DSP=../dsp AICODIX_CODE=../code MODEM_SRC=../modem \
+               -j"$(nproc)"
+
+      - name: Stage install tree
+        working-directory: m73
+        run: |
+          make -f packaging/Makefile.pkg install DESTDIR=../staging PREFIX=/usr \
+               CC="${{ matrix.cc }}" CXX="${{ matrix.cxx }}"
+
+      - name: Build .rpm
+        working-directory: m73
+        run: |
+          PATHS="usr"
+          HIDAPI_DEP=""
+          if [ -d ../staging/lib ]; then
+            PATHS="$PATHS lib"
+            HIDAPI_DEP="-d ${{ matrix.dep_hidapi }}"
+          fi
+          fpm -s dir -t rpm \
+            -n modem73 \
+            -v "${{ needs.prep.outputs.version }}" \
+            -a "${{ matrix.arch }}" \
+            --description "KISS TNC frontend for the aicodix OFDM modem." \
+            --url "https://github.com/${{ github.repository }}" \
+            --license "see LICENSE" \
+            --maintainer "modem73 maintainers" \
+            -d glibc \
+            -d '${{ matrix.dep_cxx }}' \
+            -d '${{ matrix.dep_ncurses }}' \
+            $HIDAPI_DEP \
+            -C ../staging \
+            -p "../modem73_${{ needs.prep.outputs.version }}_${{ matrix.id }}_${{ matrix.arch }}.rpm" \
+            $PATHS
+
+      - name: Checksums
+        run: |
+          for f in modem73_*.rpm; do
+            sha256sum "$f" | tee "${f}.sha256"
+            sha512sum "$f" | tee "${f}.sha512"
+          done
+
+      - name: Smoke test
+        run: |
+          RPM="$(ls modem73_*.rpm)"
+          if [ "${{ matrix.family }}" = "fedora" ]; then
+            dnf -y install "./$RPM"
+          else
+            zypper -n --no-gpg-checks install --allow-unsigned-rpm "./$RPM"
+          fi
+          command -v modem73
+          rpm -ql modem73 | head -30
+          timeout 10 modem73 --help >/dev/null 2>&1 || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-rpm-${{ matrix.id }}-${{ matrix.arch }}
+          path: |
+            modem73_*.rpm
+            modem73_*.rpm.sha256
+            modem73_*.rpm.sha512
+
+  release:
+    needs: [prep, build-deb, build-rpm]
+    if: |
+      always() &&
+      ((github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
+       (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true'))
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: pkg-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR dist
+
       - name: Attach to release
-        if: |
-          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
-          (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
         uses: softprops/action-gh-release@v2
         with:
-          # On tag push, action-gh-release uses the ref's tag automatically.
-          # On workflow_dispatch we set it explicitly from the version input.
           tag_name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
           name: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', github.event.inputs.version) || '' }}
           files: |
-            modem73_*.deb
-            modem73_*.deb.sha256
-            modem73_*.deb.sha512
+            dist/modem73_*.deb
+            dist/modem73_*.deb.sha256
+            dist/modem73_*.deb.sha512
+            dist/modem73_*.rpm
+            dist/modem73_*.rpm.sha256
+            dist/modem73_*.rpm.sha512
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
