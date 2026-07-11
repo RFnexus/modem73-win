@@ -13,7 +13,7 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC)
 TARGET = modem73
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh tnc_ui.hh control_port.hh
+HDRS = kiss_tnc.hh csma.hh miniaudio_audio.hh rigctl_ptt.hh modem.hh phy/mfsk_modem.hh tnc_ui.hh control_port.hh
 OBJS = deps/miniaudio.o deps/cJSON.o
 
 # defualt to build with UI, headless operations through --headless
@@ -53,7 +53,7 @@ ifneq ($(HIDAPI_LIBS),)
 endif
 
 clean:
-	rm -f $(TARGET) $(OBJS) test_fade test_awgn test_mfsk test_robust test_e2e
+	rm -f $(TARGET) $(OBJS) test_suite/test_fade test_suite/test_awgn test_suite/test_mfsk test_suite/test_robust test_suite/test_e2e test_suite/test_csma test_suite/wav_decode
 
 install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/
@@ -68,20 +68,26 @@ endif
 debug: CXXFLAGS = -std=c++17 -g -O0 -Wall -Wextra -DDEBUG
 debug: $(TARGET)
 
-test_fade: test_fade.cc modem.hh phy/common.hh
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ test_fade.cc -lm
+test_fade: test_suite/test_fade.cc modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_fade.cc -lm
 
-test_awgn: test_awgn.cc modem.hh phy/common.hh
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -o $@ test_awgn.cc -lm
+test_awgn: test_suite/test_awgn.cc modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_awgn.cc -lm
 
-test_mfsk: test_mfsk.cc phy/mfsk_modem.hh
-	$(CXX) $(CXXFLAGS) -o $@ test_mfsk.cc -lm
+test_mfsk: test_suite/test_mfsk.cc phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_mfsk.cc -lm
 
-test_robust: test_robust.cc phy/robust_modem.hh phy/common.hh
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -Iphy -o $@ test_robust.cc -lm
+test_robust: test_suite/test_robust.cc phy/robust_modem.hh phy/common.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_robust.cc -lm
 
-test_e2e: test_e2e.cc modem.hh phy/robust_modem.hh phy/mfsk_modem.hh
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -Iphy -o $@ test_e2e.cc -lm
+test_e2e: test_suite/test_e2e.cc modem.hh phy/robust_modem.hh phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_e2e.cc -lm
+
+test_csma: test_suite/test_csma.cc csma.hh phy/robust_modem.hh miniaudio_audio.hh deps/miniaudio.o
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/test_csma.cc deps/miniaudio.o -lpthread -ldl -lm
+
+wav_decode: test_suite/wav_decode.cc modem.hh phy/robust_modem.hh phy/mfsk_modem.hh
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I. -Iphy -o test_suite/$@ test_suite/wav_decode.cc -lm
 
 # Help
 help:

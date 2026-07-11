@@ -149,6 +149,12 @@ public:
     std::vector<float> encode(const uint8_t* data, size_t len,
                               int center_freq, RobustMode mode) {
         using namespace robust_detail;
+        if (rot_nc_ != RobustParams::nc(mode)) {
+            rot_nc_ = RobustParams::nc(mode);
+            for (int k = 0; k < rot_nc_; ++k)
+                rot_[k] = DSP::polar<value>(1,
+                    (value)M_PI * k * k / rot_nc_);
+        }
         const int order = RobustParams::code_order(mode);
         const int cbits = RobustParams::code_bits(mode);
         const int nrows = RobustParams::nrows(mode);
@@ -191,14 +197,14 @@ public:
             CODE::MLS noise_seq(0x331);
             for (int k = 0; k < nc; ++k)
                 tones[k] = cmplx(nrz(noise_seq()), 0);
-            emit_symbol(out, tones, base, nc);
+            emit_symbol(out, tones, base, nc, true);
         }
         {
             cmplx tones[RobustParams::NC_MAX];
             for (int k = 0; k < nc; ++k)
                 tones[k] = cmplx(pre[k], 0);
-            emit_symbol(out, tones, base, nc);
-            emit_symbol(out, tones, base, nc);
+            emit_symbol(out, tones, base, nc, true);
+            emit_symbol(out, tones, base, nc, true);
         }
         int kbit = 0;
         const int total_bits = cbits * copies;
@@ -227,8 +233,8 @@ public:
             cmplx tones[RobustParams::NC_MAX];
             for (int k = 0; k < nc; ++k)
                 tones[k] = cmplx(post[k], 0);
-            emit_symbol(out, tones, base, nc);
-            emit_symbol(out, tones, base, nc);
+            emit_symbol(out, tones, base, nc, true);
+            emit_symbol(out, tones, base, nc, true);
         }
         return out;
     }
@@ -237,6 +243,8 @@ public:
 
 private:
     DSP::FastFourierTransform<RobustParams::NFFT, robust_detail::cmplx, 1> bwd_;
+    robust_detail::cmplx rot_[RobustParams::NC_MAX];
+    int rot_nc_ = 0;
     CODE::PolarEncoder<int8_t> polar_encoder_;
     CODE::CRC<uint32_t> crc_{0x8F6E37A0};
     int8_t mesg_[RobustParams::DATA_BITS + RobustParams::CRC_BITS];
@@ -247,13 +255,13 @@ private:
     int8_t perm_[1 << 14];
 
     void emit_symbol(std::vector<float>& out, const robust_detail::cmplx* tones,
-                     int base, int nc) {
+                     int base, int nc, bool rotate = false) {
         typedef robust_detail::cmplx cmplx;
         cmplx fdom[RobustParams::NFFT], tdom[RobustParams::NFFT];
         for (int i = 0; i < RobustParams::NFFT; ++i)
             fdom[i] = cmplx(0, 0);
         for (int k = 0; k < nc; ++k)
-            fdom[base + k] = tones[k];
+            fdom[base + k] = rotate ? tones[k] * rot_[k] : tones[k];
         bwd_(tdom, fdom);
         const float scale = 0.5f / std::sqrt((float)nc);
         auto clip = [](float v) {
@@ -295,6 +303,8 @@ public:
             nmodes_ = 6;
         }
         nc_ = RobustParams::nc(modes_[0]);
+        for (int k = 0; k < nc_; ++k)
+            rot_[k] = DSP::polar<value>(1, (value)M_PI * k * k / nc_);
         nrows_top_ = RobustParams::nrows(modes_[nmodes_ - 1]);
         keep_ = (size_t)(nrows_top_ + 10) * RobustParams::SYM + 2 * D;
         configure(center_freq);
@@ -329,6 +339,7 @@ public:
         Ra_ = Rb_ = 0;
         rows_done_ = 0;
         tried_mask_ = 0;
+        pilot_alive_total_ = -1;
     }
 
     void process(const float* samples, size_t count, FrameCallback callback) {
@@ -402,6 +413,7 @@ public:
                         state_ = State::COLLECT;
                         locked_q_ = lock_q_;
                         cand_deadline_ = -1;
+                        pilot_alive_total_ = total_in_;
                     } else {
                         if (kind == 2) {
                             if (rescue_backward(callback))
@@ -443,11 +455,15 @@ public:
                     int s_bu = base_use_, s_rd = rows_done_;
                     unsigned s_tm = tried_mask_;
                     peak_pos_ = cand_pos_;
-                    if (lock() == 1 && lock_q_ > locked_q_ + value(0.08)) {
+                    bool stale = pilot_alive_total_ >= 0 &&
+                                 total_in_ - pilot_alive_total_ >= PREEMPT_STALE;
+                    if (lock() == 1 && (lock_q_ > locked_q_ + value(0.08) || stale)) {
                         std::cerr << "RDM" << (narrow_ ? "n" : "")
                                   << ": collect preempted (q=" << lock_q_
-                                  << " over " << locked_q_ << ")" << std::endl;
+                                  << " over " << locked_q_
+                                  << (stale ? ", stale" : "") << ")" << std::endl;
                         locked_q_ = lock_q_;
+                        pilot_alive_total_ = total_in_;
                         ++stats_false_locks;
                         break;
                     }
@@ -461,6 +477,14 @@ public:
                         break;
                     take_row(rows_done_, start);
                     ++rows_done_;
+                    if ((rows_done_ - 1) % RobustParams::NS == 0) {
+                        int pr = (rows_done_ - 1) / RobustParams::NS;
+                        int wrows = nc_ <= 8 ? 48 : 12;
+                        int w = pr + 1 < wrows ? pr + 1 : wrows;
+                        if (pr >= 2 && (pr + 1) % 2 == 0 &&
+                            pilot_window_live(pr, w, 0.10f))
+                            pilot_alive_total_ = total_in_;
+                    }
                     if (rows_done_ == 2 * RobustParams::NS + 1 &&
                         pilot_sanity(3, nc_ <= 8 ? 0.45f : 0.28f)) {
                         ++stats_sync_count;
@@ -513,6 +537,14 @@ public:
     float get_last_ber() const { return last_ber_; }
     float get_ber_ema() const { return ber_ema_; }
     RobustMode get_last_mode() const { return last_mode_; }
+
+    bool in_frame() const { return state_ != State::SEARCH; }
+
+    bool carrier_active() const {
+        return state_ != State::SEARCH &&
+               (pilot_alive_total_ < 0 ||
+                total_in_ - pilot_alive_total_ < PILOT_GRACE);
+    }
 
     int stats_sync_count = 0;
     int stats_preamble_errors = 0;
@@ -602,8 +634,12 @@ private:
     value cand_metric_ = 0;
     int64_t cand_pos_ = 0;
     int64_t cand_deadline_ = -1;
+    int64_t pilot_alive_total_ = -1;
+    static constexpr int64_t PILOT_GRACE = 120000;
+    static constexpr int64_t PREEMPT_STALE = 288000;
 
     cmplx rows_[RobustParams::NROWS_MAX][RobustParams::NC_MAX];
+    cmplx rot_[RobustParams::NC_MAX];
     int8_t pre_[RobustParams::NC_MAX];
     int8_t post_[RobustParams::NC_MAX];
     bool seq_init_ = false;
@@ -664,7 +700,7 @@ private:
                 continue;
             cmplx d[RobustParams::NC_MAX];
             for (int k = 0; k < nc_; ++k)
-                d[k] = (value)known[k] * b[2 + boff + k];
+                d[k] = (value)known[k] * conj(rot_[k]) * b[2 + boff + k];
             for (int k = 0; k + 1 < nc_; ++k) {
                 s = s + d[k + 1] * conj(d[k]);
                 pwr += norm(d[k]);
@@ -791,6 +827,27 @@ private:
         window_fft(start, bins);
         for (int k = 0; k < nc_; ++k)
             rows_[row][k] = bins[2 + k];
+    }
+
+    bool pilot_window_live(int last_pr, int wrows, float gate) {
+        using namespace robust_detail;
+        CODE::MLS ps(0x163, narrow_ ? 89 : 1);
+        int first = last_pr - wrows + 1;
+        for (int i = 0; i < first * nc_; ++i)
+            ps();
+        cmplx s(0, 0);
+        value pwr = 0;
+        for (int p = first; p <= last_pr; ++p) {
+            cmplx d[RobustParams::NC_MAX];
+            for (int k = 0; k < nc_; ++k)
+                d[k] = (value)nrz(ps()) * rows_[p * RobustParams::NS][k];
+            for (int k = 0; k + 1 < nc_; ++k) {
+                s = s + d[k + 1] * conj(d[k]);
+                pwr += norm(d[k]);
+            }
+            pwr += norm(d[nc_ - 1]);
+        }
+        return abs(s) / (pwr + value(1e-9)) >= (value)gate;
     }
 
     void consume_anchor() {
