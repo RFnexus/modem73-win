@@ -103,6 +103,11 @@ struct TNCConfig {
     float carrier_threshold_db = -30.0f;
     int carrier_sense_ms = 100;
     int max_backoff_slots = 10;
+    int csma_quiet_ms = 0;
+    int csma_cw = 8;
+    int csma_responder_dither = 0;
+    bool tx_lead_tone = false;
+    int csma_burst = 1;
     
     // RX decoder settings
     bool mfsk_rx_enabled = true;
@@ -392,12 +397,19 @@ inline std::vector<uint8_t> unframe_length(const uint8_t* data, size_t total_len
     return std::vector<uint8_t>(data + 2, data + 2 + payload_len);
 }
 
+inline int64_t steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 // TX packet with optional per-packet mode override
 struct TxPacket {
     std::vector<uint8_t> data;
     int oper_mode;  // -1 = use default mode
-    TxPacket() : oper_mode(-1) {}
-    TxPacket(std::vector<uint8_t> d, int mode = -1) : data(std::move(d)), oper_mode(mode) {}
+    int64_t enqueue_ms;
+    TxPacket() : oper_mode(-1), enqueue_ms(steady_now_ms()) {}
+    TxPacket(std::vector<uint8_t> d, int mode = -1)
+        : data(std::move(d)), oper_mode(mode), enqueue_ms(steady_now_ms()) {}
 };
 
 namespace Frag {

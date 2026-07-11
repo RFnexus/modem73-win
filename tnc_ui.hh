@@ -38,6 +38,24 @@ const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
 const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
 const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)"};
 
+struct CsmaPreset {
+    const char* name;
+    int quiet_ms;
+    int cw;
+    int slot_ms;
+    int burst;
+    int dither;
+    bool lead_tone;
+};
+static const CsmaPreset CSMA_PRESETS[] = {
+    {"BENCH",    0,  3, 500, 3, 0,    true},
+    {"RELAXED",  0,  8, 500, 3, 300,  true},
+    {"MODERATE", 0, 12, 500, 2, 800,  true},
+    {"BUSY",     0, 16, 500, 2, 1500, true},
+};
+static constexpr int CSMA_PRESET_COUNT =
+    (int)(sizeof(CSMA_PRESETS) / sizeof(CSMA_PRESETS[0]));
+
 struct AltMode {
     const char* label;
     int modem_type;
@@ -132,7 +150,13 @@ struct TNCUIState {
     bool csma_enabled = true;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
+    int csma_quiet_ms = 0;
+    int csma_cw = 8;
     int p_persistence = 128;
+    bool tx_lead_tone = false;
+    int csma_responder_dither = 0;
+    int csma_burst = 1;
+    bool csma_advanced_open = false;
     
     // Audio settings 
     std::string audio_input_device = "default";
@@ -597,7 +621,12 @@ struct TNCUIState {
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
+        fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
+        fprintf(f, "csma_cw=%d\n", csma_cw);
         fprintf(f, "p_persistence=%d\n", p_persistence);
+        fprintf(f, "tx_lead_tone=%d\n", tx_lead_tone ? 1 : 0);
+        fprintf(f, "csma_responder_dither=%d\n", csma_responder_dither);
+        fprintf(f, "csma_burst=%d\n", csma_burst);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
         fprintf(f, "# Audio/PTT\n");
@@ -673,7 +702,12 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
+                else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
+                else if (strcmp(key, "csma_cw") == 0) csma_cw = atoi(value);
                 else if (strcmp(key, "p_persistence") == 0) p_persistence = atoi(value);
+                else if (strcmp(key, "tx_lead_tone") == 0) tx_lead_tone = atoi(value) != 0;
+                else if (strcmp(key, "csma_responder_dither") == 0) csma_responder_dither = atoi(value);
+                else if (strcmp(key, "csma_burst") == 0) csma_burst = atoi(value);
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
@@ -1106,7 +1140,13 @@ private:
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
-        FIELD_PERSISTENCE,
+        FIELD_CSMA_PRESET,
+        FIELD_CSMA_ADV,
+        FIELD_CSMA_QUIET,
+        FIELD_CSMA_CW,
+        FIELD_LEAD_TONE,
+        FIELD_RESP_DITHER,
+        FIELD_CSMA_BURST,
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
@@ -1305,6 +1345,8 @@ private:
                 if (current_tab_ == 1) {
                     if (current_field_ == FIELD_CSMA_INFO) {
                         show_csma_help_ = true;
+                    } else if (current_field_ == FIELD_CSMA_ADV) {
+                        state_.csma_advanced_open = !state_.csma_advanced_open;
                     } else if (current_field_ == FIELD_CALLSIGN) {
 
 
@@ -1726,6 +1768,12 @@ private:
             }
         }
 #endif
+        if (!state_.csma_advanced_open) {
+            if (field == FIELD_CSMA_QUIET || field == FIELD_CSMA_CW ||
+                field == FIELD_LEAD_TONE || field == FIELD_RESP_DITHER ||
+                field == FIELD_CSMA_BURST)
+                return true;
+        }
         return false;
     }
     
@@ -1765,8 +1813,22 @@ private:
         if (field == FIELD_THRESHOLD) return row;
         row++;
         row++;
-        if (field == FIELD_PERSISTENCE) return row;
+        if (field == FIELD_CSMA_PRESET) return row;
         row++;
+        if (field == FIELD_CSMA_ADV) return row;
+        row++;
+        if (state_.csma_advanced_open) {
+            if (field == FIELD_CSMA_QUIET) return row;
+            row++;
+            if (field == FIELD_CSMA_CW) return row;
+            row++;
+            if (field == FIELD_LEAD_TONE) return row;
+            row++;
+            if (field == FIELD_RESP_DITHER) return row;
+            row++;
+            if (field == FIELD_CSMA_BURST) return row;
+            row++;
+        }
         if (field == FIELD_CSMA_INFO) return row;
         row += 2;
         row += 2;
@@ -1815,6 +1877,20 @@ private:
         return row;
     }
 
+    int csma_preset_match() const {
+        for (int i = 0; i < CSMA_PRESET_COUNT; ++i) {
+            const CsmaPreset& p = CSMA_PRESETS[i];
+            if (state_.csma_quiet_ms == p.quiet_ms &&
+                state_.csma_cw == p.cw &&
+                state_.slot_time_ms == p.slot_ms &&
+                state_.csma_burst == p.burst &&
+                state_.csma_responder_dither == p.dither &&
+                state_.tx_lead_tone == p.lead_tone)
+                return i;
+        }
+        return -1;
+    }
+
     void adjust_field(int delta) {
         switch (current_field_) {
             case FIELD_MODEM_TYPE:
@@ -1857,9 +1933,41 @@ private:
                 state_.carrier_threshold_db += delta * 2;
                 state_.carrier_threshold_db = std::max(-80.0f, std::min(0.0f, state_.carrier_threshold_db));
                 break;
-            case FIELD_PERSISTENCE:
-                state_.p_persistence += delta * 8;
-                state_.p_persistence = std::max(0, std::min(255, state_.p_persistence));
+            case FIELD_CSMA_PRESET: {
+                int idx = csma_preset_match();
+                idx = idx < 0 ? (delta > 0 ? 0 : CSMA_PRESET_COUNT - 1)
+                              : (idx + delta + CSMA_PRESET_COUNT) % CSMA_PRESET_COUNT;
+                const CsmaPreset& p = CSMA_PRESETS[idx];
+                state_.csma_quiet_ms = p.quiet_ms;
+                state_.csma_cw = p.cw;
+                state_.slot_time_ms = p.slot_ms;
+                state_.csma_burst = p.burst;
+                state_.csma_responder_dither = p.dither;
+                state_.tx_lead_tone = p.lead_tone;
+                state_.add_log(std::string("CSMA preset: ") + p.name);
+                break;
+            }
+            case FIELD_CSMA_ADV:
+                state_.csma_advanced_open = !state_.csma_advanced_open;
+                return;
+            case FIELD_CSMA_QUIET:
+                state_.csma_quiet_ms += delta * 250;
+                state_.csma_quiet_ms = std::max(0, std::min(10000, state_.csma_quiet_ms));
+                break;
+            case FIELD_CSMA_CW:
+                state_.csma_cw += delta;
+                state_.csma_cw = std::max(2, std::min(32, state_.csma_cw));
+                break;
+            case FIELD_LEAD_TONE:
+                state_.tx_lead_tone = !state_.tx_lead_tone;
+                break;
+            case FIELD_RESP_DITHER:
+                state_.csma_responder_dither += delta * 100;
+                state_.csma_responder_dither = std::max(0, std::min(3000, state_.csma_responder_dither));
+                break;
+            case FIELD_CSMA_BURST:
+                state_.csma_burst += delta;
+                state_.csma_burst = std::max(1, std::min(4, state_.csma_burst));
                 break;
             case FIELD_FRAGMENTATION:
                 state_.fragmentation_enabled = !state_.fragmentation_enabled;
@@ -2364,7 +2472,7 @@ private:
         attron(A_DIM);
         addch(ACS_VLINE);
         attroff(A_DIM);
-        if (state_.ptt_on) {
+        if (state_.ptt_on || state_.transmitting) {
             attron(COLOR_PAIR(2) | A_BOLD);
             addstr(" TX ");
             attroff(COLOR_PAIR(2) | A_BOLD);
@@ -3083,14 +3191,68 @@ private:
         
         dy = visible_y(row);
         if (dy >= 0) {
-            char persist_buf[32];
-            snprintf(persist_buf, sizeof(persist_buf), "%d", state_.p_persistence);
-            draw_selector_field(dy, c1, c2, "Persist", FIELD_PERSISTENCE, persist_buf);
-            char slot_buf[32];
-            snprintf(slot_buf, sizeof(slot_buf), "%dms", state_.slot_time_ms);
-            mvaddstr(dy, c2 + 6, slot_buf);
+            int pidx = csma_preset_match();
+            draw_selector_field(dy, c1, c2, "Preset", FIELD_CSMA_PRESET,
+                                pidx >= 0 ? CSMA_PRESETS[pidx].name : "CUSTOM");
         }
         row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            bool sel_adv = (current_field_ == FIELD_CSMA_ADV);
+            if (sel_adv) attron(A_BOLD); else attron(A_DIM);
+            mvprintw(dy, c1, "%s[%c] Advanced", sel_adv ? "> " : "  ",
+                     state_.csma_advanced_open ? '-' : '+');
+            if (sel_adv) attroff(A_BOLD); else attroff(A_DIM);
+        }
+        row++;
+
+        if (state_.csma_advanced_open) {
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char quiet_buf[32];
+                if (state_.csma_quiet_ms > 0)
+                    snprintf(quiet_buf, sizeof(quiet_buf), "%d ms", state_.csma_quiet_ms);
+                else
+                    snprintf(quiet_buf, sizeof(quiet_buf), "AUTO");
+                draw_selector_field(dy, c1 + 2, c2, "Quiet", FIELD_CSMA_QUIET, quiet_buf);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char cw_buf[32];
+                snprintf(cw_buf, sizeof(cw_buf), "%d x %dms", state_.csma_cw, state_.slot_time_ms);
+                draw_selector_field(dy, c1 + 2, c2, "Window", FIELD_CSMA_CW, cw_buf);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) draw_toggle_field(dy, c1 + 2, c2, "Lead Tone", FIELD_LEAD_TONE, state_.tx_lead_tone);
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char dith_buf[32];
+                if (state_.csma_responder_dither > 0)
+                    snprintf(dith_buf, sizeof(dith_buf), "%d ms", state_.csma_responder_dither);
+                else
+                    snprintf(dith_buf, sizeof(dith_buf), "OFF");
+                draw_selector_field(dy, c1 + 2, c2, "Resp Dither", FIELD_RESP_DITHER, dith_buf);
+            }
+            row++;
+
+            dy = visible_y(row);
+            if (dy >= 0) {
+                char burst_buf[32];
+                if (state_.csma_burst > 1)
+                    snprintf(burst_buf, sizeof(burst_buf), "%d pkts", state_.csma_burst);
+                else
+                    snprintf(burst_buf, sizeof(burst_buf), "OFF");
+                draw_selector_field(dy, c1 + 2, c2, "Burst", FIELD_CSMA_BURST, burst_buf);
+            }
+            row++;
+        }
 
         dy = visible_y(row);
         if (dy >= 0) {
@@ -4956,7 +5118,7 @@ private:
     }
     
     void draw_csma_help(int rows, int cols) {
-        int w = 56, h = 13;
+        int w = 58, h = 18;
         int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
@@ -4984,8 +5146,12 @@ private:
         item("Enabled",   "turn channel checking on or off");
         item("Threshold", "level above this counts as busy");
         item("Level",     "what the channel measures right now");
-        item("Persist",   "chance out of 255 to send each slot");
-        item("Slot",      "wait between send attempts when busy");
+        item("Preset",    "quick setups by how busy the band is");
+        item("Quiet",     "idle time required before contending");
+        item("Window",    "random wait range drawn after quiet");
+        item("Lead Tone", "keyup tone so others hear us sooner");
+        item("Dither",    "callsign delay that separates replies");
+        item("Burst",     "packets sent per channel win");
         y++;
         attron(A_DIM);
         mvaddstr(y, lx, "any key to close");

@@ -95,7 +95,7 @@ public:
               const std::string& playback_dev = "default",
               int sample_rate = 48000)
         : capture_device_id_(capture_dev), playback_device_id_(playback_dev), sample_rate_(sample_rate) {
-        capture_buffer_.resize(RING_BUFFER_SIZE, 0.0f);
+        capture_buffer_.resize(CAPTURE_RING_SIZE, 0.0f);
         playback_buffer_.resize(RING_BUFFER_SIZE, 0.0f);
     }
     
@@ -240,14 +240,14 @@ public:
         while (frames_read < frames) {
             size_t read_pos = capture_read_pos_.load();
             size_t write_pos = capture_write_pos_.load();
-            size_t available = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
+            size_t available = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
             
             if (available > 0) {
                 int to_read = std::min((int)available, frames - frames_read);
                 for (int i = 0; i < to_read; i++) {
-                    buffer[frames_read + i] = capture_buffer_[(read_pos + i) % RING_BUFFER_SIZE];
+                    buffer[frames_read + i] = capture_buffer_[(read_pos + i) % CAPTURE_RING_SIZE];
                 }
-                capture_read_pos_ = (read_pos + to_read) % RING_BUFFER_SIZE;
+                capture_read_pos_ = (read_pos + to_read) % CAPTURE_RING_SIZE;
                 frames_read += to_read;
                 consecutive_read_failures_ = 0; 
             } else {
@@ -348,8 +348,37 @@ public:
 
 
 
+    bool capture_alive() {
+        return capture_open_ &&
+               block_seq_.load(std::memory_order_acquire) > 0 &&
+               steady_ms() - last_block_ms_.load(std::memory_order_relaxed) <= 250;
+    }
+
+    float instant_level_db(int window_ms = 100) {
+        if (!capture_open_) return 0.0f;
+        if (steady_ms() - last_block_ms_.load(std::memory_order_relaxed) > 250)
+            return 0.0f;
+        uint64_t seq = block_seq_.load(std::memory_order_acquire);
+        if (seq == 0) return 0.0f;
+        uint64_t need = (uint64_t)sample_rate_ * window_ms / 1000;
+        double energy = 0.0;
+        uint64_t frames = 0;
+        uint64_t count = seq < LEVEL_RING ? seq : LEVEL_RING;
+        for (uint64_t k = 1; k <= count; k++) {
+            uint64_t idx = (seq - k) % LEVEL_RING;
+            uint32_t bf = block_frames_[idx].load(std::memory_order_relaxed);
+            energy += block_msq_[idx].load(std::memory_order_relaxed) * bf;
+            frames += bf;
+            if (frames >= need) break;
+        }
+        if (frames == 0) return 0.0f;
+        float rms = std::sqrt(energy / frames);
+        if (rms < 1e-10f) return -100.0f;
+        return 20.0f * std::log10(rms);
+    }
+
     float measure_level(int duration_ms = 100) {
-        if (!capture_open_) return -100.0f;
+        if (!capture_open_) return 0.0f;
         uint64_t start_samples = capture_samples_.load();
         double start_energy = capture_energy_.load();
         std::this_thread::sleep_for(std::chrono::milliseconds(std::max(duration_ms, 10)));
@@ -366,6 +395,7 @@ public:
     
 private:
     static constexpr size_t RING_BUFFER_SIZE = 48000;
+    static constexpr size_t CAPTURE_RING_SIZE = 8 * 48000;
     
     bool ensure_context() {
         if (context_initialized_) return true;
@@ -406,16 +436,16 @@ private:
         
         size_t read_pos = self->capture_read_pos_.load();
         size_t write_pos = self->capture_write_pos_.load();
-        size_t used = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
-        size_t available = RING_BUFFER_SIZE - 1 - used;
+        size_t used = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
+        size_t available = CAPTURE_RING_SIZE - 1 - used;
         
         ma_uint32 to_write = std::min((ma_uint32)available, frame_count);
 
         for (ma_uint32 i = 0; i < to_write; i++) {
-            self->capture_buffer_[(write_pos + i) % RING_BUFFER_SIZE] = in[i];
+            self->capture_buffer_[(write_pos + i) % CAPTURE_RING_SIZE] = in[i];
         }
 
-        self->capture_write_pos_ = (write_pos + to_write) % RING_BUFFER_SIZE;
+        self->capture_write_pos_ = (write_pos + to_write) % CAPTURE_RING_SIZE;
 
         float sum_sq = 0.0f;
         for (ma_uint32 i = 0; i < frame_count; i++) {
@@ -423,6 +453,21 @@ private:
         }
         self->capture_energy_.store(self->capture_energy_.load() + sum_sq);
         self->capture_samples_.store(self->capture_samples_.load() + frame_count);
+
+        if (frame_count > 0) {
+            uint64_t seq = self->block_seq_.load(std::memory_order_relaxed);
+            self->block_msq_[seq % LEVEL_RING].store(sum_sq / frame_count,
+                                                     std::memory_order_relaxed);
+            self->block_frames_[seq % LEVEL_RING].store(frame_count,
+                                                        std::memory_order_relaxed);
+            self->block_seq_.store(seq + 1, std::memory_order_release);
+            self->last_block_ms_.store(steady_ms(), std::memory_order_relaxed);
+        }
+    }
+
+    static int64_t steady_ms() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
     }
     
     std::string capture_device_id_;
@@ -452,4 +497,9 @@ private:
     // Running signal level for CSMA
     std::atomic<double> capture_energy_{0.0};
     std::atomic<uint64_t> capture_samples_{0};
+    static constexpr size_t LEVEL_RING = 64;
+    std::atomic<double> block_msq_[LEVEL_RING] = {};
+    std::atomic<uint32_t> block_frames_[LEVEL_RING] = {};
+    std::atomic<uint64_t> block_seq_{0};
+    std::atomic<int64_t> last_block_ms_{0};
 };

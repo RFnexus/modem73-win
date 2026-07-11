@@ -30,6 +30,7 @@
 
 // Local includes
 #include "kiss_tnc.hh"
+#include "csma.hh"
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
 #include "serial_ptt.hh"
@@ -542,71 +543,166 @@ private:
                 
                 // CSMA
                 bool csma_enabled;
-                int max_backoff_slots, carrier_sense_ms, slot_time_ms, p_persistence;
+                int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst;
                 float carrier_threshold_db;
+                std::string csma_callsign;
                 {
                     std::lock_guard<std::mutex> lock(config_mutex_);
                     csma_enabled = config_.csma_enabled;
-                    max_backoff_slots = config_.max_backoff_slots;
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
-                    p_persistence = config_.p_persistence;
+                    csma_quiet_ms = config_.csma_quiet_ms;
+                    csma_cw = config_.csma_cw;
+                    csma_dither = config_.csma_responder_dither;
+                    csma_burst = std::max(1, std::min(4, config_.csma_burst));
+                    csma_callsign = config_.callsign;
                 }
                 if (csma_enabled) {
-                    int backoff_count = 0;
-
-                    while (backoff_count < max_backoff_slots) {
-                        // Re-check lockout after backoff
-                        if (!is_tx_allowed()) {
-                            wait_for_tx_allowed();
+                    CsmaConfig gcfg;
+                    gcfg.threshold_db = carrier_threshold_db;
+                    gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
+                    gcfg.cw = csma_cw;
+                    gcfg.slot_ms = slot_time_ms;
+                    gcfg.busy_limit_ms = std::max(30000, 8 * frame_air_ms());
+                    if (csma_dither > 0) {
+                        uint32_t hash = 2166136261u;
+                        for (char c : csma_callsign) {
+                            hash ^= (uint8_t)c;
+                            hash *= 16777619u;
                         }
+                        gcfg.responder_quiet_ms += (int)(hash % (uint32_t)csma_dither);
+                    }
+                    int64_t rx_ms = last_rx_done_ms_.load();
+                    gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
+                                     pkt.enqueue_ms - rx_ms <= 2000 &&
+                                     steady_now_ms() - rx_ms <= 5000;
+                    CsmaGate gate(gcfg, (uint32_t)gen());
 
-                        // Check carrier
-                        float level_db = audio_->measure_level(carrier_sense_ms);
-                        bool is_busy = (level_db > carrier_threshold_db);
+                    if (gcfg.responder) {
+                        std::cerr << "CSMA: responder priority, quiet "
+                                  << gate.quiet_needed_ms() << " ms" << std::endl;
+                    }
 
-                        if (is_busy) {
-                            // Channel busy - wait
-                            std::uniform_int_distribution<> slots_dist(1,
-                                std::min(1 << backoff_count, max_backoff_slots));
-                            int slots = slots_dist(gen);
-                            int wait_ms = slots * slot_time_ms;
-
-                            std::cerr << "CSMA: Channel busy (" << level_db << " dB > "
-                                      << carrier_threshold_db << " dB), backing off "
-                                      << slots << " slots (" << wait_ms << " ms)" << std::endl;
-
-                            std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-                            backoff_count++;
-                        } else {
-                            // Channel clear - apply p-persistence
-                            std::uniform_int_distribution<> p_dist(0, 255);
-                            if (p_dist(gen) <= p_persistence) {
-                                std::cerr << "CSMA: Channel clear (" << level_db << " dB), transmitting" << std::endl;
+                    bool was_busy = false, was_deaf = false, quiet_logged = false;
+                    while (g_running) {
+                        bool alive = audio_->capture_alive();
+                        float level_db = audio_->instant_level_db(carrier_sense_ms);
+                        bool allowed = is_tx_allowed();
+                        auto v = gate.step(level_db, alive, allowed);
+                        if (v == CsmaGate::Verdict::TRANSMIT) {
+                            switch (gate.reason()) {
+                            case CsmaGate::Reason::NO_AUDIO:
+                                std::cerr << "CSMA: no capture audio for "
+                                          << gate.deaf_ms() << " ms, transmitting blind"
+                                          << std::endl;
                                 break;
-                            } else {
-                                std::cerr << "CSMA: Channel clear but deferring (p="
-                                          << p_persistence << "/255)" << std::endl;
-                                std::this_thread::sleep_for(
-                                    std::chrono::milliseconds(slot_time_ms));
+                            case CsmaGate::Reason::BUSY_OVERRIDE:
+                                std::cerr << "CSMA: channel busy for "
+                                          << gate.busy_ms() << " ms, transmitting anyway"
+                                          << std::endl;
+                                break;
+                            default:
+                                std::cerr << "CSMA: Channel clear (" << level_db
+                                          << " dB), transmitting" << std::endl;
                             }
+                            break;
                         }
+                        if (!alive && !was_deaf) {
+                            std::cerr << "CSMA: no capture audio, holding TX" << std::endl;
+                        }
+                        was_deaf = !alive;
+                        bool busy = alive && (!allowed || level_db > carrier_threshold_db);
+                        if (busy && !was_busy) {
+                            if (!allowed) {
+                                std::cerr << "CSMA: receiving, deferring" << std::endl;
+                            } else {
+                                std::cerr << "CSMA: Channel busy (" << level_db << " dB > "
+                                          << carrier_threshold_db << " dB), deferring"
+                                          << std::endl;
+                            }
+                            quiet_logged = false;
+                        }
+                        was_busy = busy;
+                        if (!quiet_logged && gate.quiet_met()) {
+                            std::cerr << "CSMA: Quiet " << gate.quiet_needed_ms()
+                                      << " ms met, contention " << gate.contention_left_ms()
+                                      << "/" << gate.contention_drawn_ms() << " ms"
+                                      << std::endl;
+                            quiet_logged = true;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
                     }
-
-                    if (backoff_count >= max_backoff_slots) {
-                        std::cerr << "CSMA: Max backoff reached, transmitting anyway" << std::endl;
-                    }
+                    if (!g_running)
+                        break;
                 }
-                
-                transmit(pkt.data, pkt.oper_mode);
+
+                TxPacket cur = std::move(pkt);
+                bool first = true;
+                int remaining = csma_burst - 1;
+                while (true) {
+                    TxPacket next;
+                    bool have_next = remaining > 0 && tx_queue_.pop(next);
+#ifdef WITH_UI
+                    if (g_ui_state) {
+                        g_ui_state->tx_queue_size = tx_queue_.size();
+                    }
+#endif
+                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next);
+                    if (!have_next)
+                        break;
+                    std::cerr << "CSMA: burst continuation ("
+                              << remaining << " left)" << std::endl;
+                    cur = std::move(next);
+                    if (sent)
+                        first = false;
+                    --remaining;
+                }
             } else {
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
     }
     
-    void transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1) {
+    int frame_air_ms() {
+        uint64_t key = ((uint64_t)config_.modem_type << 48) ^
+                       ((uint64_t)(uint32_t)payload_size_ << 16) ^
+                       (uint32_t)(config_.modem_type == 1 ? config_.mfsk_mode :
+                                  config_.modem_type == 2 ? config_.robust_mode :
+                                  modem_config_.oper_mode);
+        if (key == frame_air_key_) return frame_air_ms_cache_;
+        std::vector<uint8_t> dummy(payload_size_ > 2 ? payload_size_ - 2 : 1, 0x55);
+        auto framed = frame_with_length(dummy);
+        std::vector<float> samples;
+        if (config_.modem_type == 1) {
+            samples = mfsk_encoder_->encode(framed.data(), framed.size(),
+                modem_config_.center_freq, (MFSKMode)config_.mfsk_mode);
+        } else if (config_.modem_type == 2) {
+            samples = robust_encoder_->encode(framed.data(), framed.size(),
+                modem_config_.center_freq, (RobustMode)config_.robust_mode);
+        } else {
+            samples = encoder_->encode(framed.data(), framed.size(),
+                modem_config_.center_freq, modem_config_.call_sign,
+                modem_config_.oper_mode, config_.postamble);
+        }
+        if (!samples.empty()) {
+            frame_air_ms_cache_ = (int)(1000.0f * samples.size() / config_.sample_rate);
+            frame_air_key_ = key;
+        } else if (frame_air_ms_cache_ <= 0) {
+            frame_air_ms_cache_ = 3000;
+        }
+        return frame_air_ms_cache_;
+    }
+
+    int auto_quiet_ms() {
+        int q = frame_air_ms() / 4;
+        if (q < 300) q = 300;
+        if (q > 3500) q = 3500;
+        return q;
+    }
+
+    bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
+                  bool first = true, bool last = true) {
         int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
         if (oper_mode_override >= 0) {
@@ -663,11 +759,25 @@ private:
         
         if (samples.empty()) {
             ui_log("TX: Encoding failed");
-            tx_blanking_active_ = false;
-#ifdef WITH_UI
-            if (g_ui_state) g_ui_state->transmitting = false;
+            if (!first && last && config_.ptt_type != PTTType::VOX) {
+                audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
+                audio_->drain_playback();
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+#ifdef WITH_CM108
+                    || config_.ptt_type == PTTType::CM108
 #endif
-            return;
+                ) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_tail_ms));
+                    set_ptt(false);
+                }
+            }
+            if (last) {
+                tx_blanking_active_ = false;
+#ifdef WITH_UI
+                if (g_ui_state) g_ui_state->transmitting = false;
+#endif
+            }
+            return false;
         }
         
         float duration = samples.size() / (float)config_.sample_rate;
@@ -723,56 +833,81 @@ private:
 #endif
         } else {
             // RIGCTL, COM, or NONE mode
-            total_tx_duration += (config_.tx_delay_ms + config_.ptt_tail_ms) / 1000.0f;
+            total_tx_duration += (first ? config_.tx_delay_ms : BURST_GAP_MS) / 1000.0f;
+            if (last)
+                total_tx_duration += config_.ptt_tail_ms / 1000.0f;
             
             ui_log("TX: " + std::to_string(samples.size()) + " samples, " + 
                    std::to_string(duration) + " seconds");
             
-            // PTT on (for RIGCTL or COM mode)
-            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+            if (first) {
+                // PTT on (for RIGCTL or COM mode)
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
-                || config_.ptt_type == PTTType::CM108
+                    || config_.ptt_type == PTTType::CM108
 #endif
-            ) {
-                set_ptt(true);
-                std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_delay_ms));
+                ) {
+                    set_ptt(true);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_delay_ms));
+                }
+
+                // Leading silence (TXDelay)
+                int lead_frames = config_.tx_delay_ms * config_.sample_rate / 1000;
+                if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
+                    int gap_frames = 150 * config_.sample_rate / 1000;
+                    auto lead = generate_tone(modem_config_.center_freq,
+                                              lead_frames - gap_frames, 0.6f);
+                    for (size_t i = 0; i < lead.size(); i += 1024) {
+                        int n = std::min(1024, (int)(lead.size() - i));
+                        audio_->write(lead.data() + i, n);
+                    }
+                    audio_->write_silence(gap_frames);
+                } else {
+                    audio_->write_silence(lead_frames);
+                }
+            } else {
+                audio_->write_silence(BURST_GAP_MS * config_.sample_rate / 1000);
             }
-            
-            // Leading silence (TXDelay)
-            audio_->write_silence(config_.tx_delay_ms * config_.sample_rate / 1000);
-            
+
             // Transmit audio
             const int chunk_size = 1024;
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
                 audio_->write(samples.data() + i, n);
             }
-            
-            // Trailing silence
-            audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
-            audio_->drain_playback();
-            
-            // PTT off
-            if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+
+            if (last) {
+                // Trailing silence
+                audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
+                audio_->drain_playback();
+
+                // PTT off
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
-                || config_.ptt_type == PTTType::CM108
+                    || config_.ptt_type == PTTType::CM108
 #endif
-            ) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_tail_ms));
-                set_ptt(false);
+                ) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(config_.ptt_tail_ms));
+                    set_ptt(false);
+                }
             }
         }
         
-        tx_blanking_active_ = false;
+        if (last) {
+            tx_blanking_active_ = false;
+        }
 
 #ifdef WITH_UI
         if (g_ui_state) {
-            g_ui_state->transmitting = false;
+            if (last) {
+                g_ui_state->transmitting = false;
+            }
             g_ui_state->total_tx_time = g_ui_state->total_tx_time.load() + total_tx_duration;
         }
 #endif
+        return true;
     }
-    
+
     // Generate a sine wave tone for VOX triggering
     std::vector<float> generate_tone(int freq_hz, int num_samples, float amplitude = 0.8f) {
         std::vector<float> tone(num_samples);
@@ -802,6 +937,7 @@ private:
         const int LEVEL_UPDATE_INTERVAL = 5;
         
         auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled) {
+            last_rx_done_ms_.store(steady_now_ms());
             ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
@@ -1025,8 +1161,8 @@ private:
                     robust_decoder_->process(buffer.data(), n, robust_frame_callback);
                     robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
 
-                    if (decoder_->in_frame() || robust_decoder_->in_frame() ||
-                        robust_decoder_n_->in_frame() ||
+                    if (decoder_->in_frame() || robust_decoder_->carrier_active() ||
+                        robust_decoder_n_->carrier_active() ||
                         (mfsk_rx && (mfsk_decoders_[0]->in_frame() ||
                                      mfsk_decoders_[1]->in_frame() ||
                                      mfsk_decoders_[2]->in_frame()))) {
@@ -1145,9 +1281,13 @@ private:
         }
     }
     
+    static constexpr int BURST_GAP_MS = 200;
+
     TNCConfig config_;
     ModemConfig modem_config_;
     int payload_size_;
+    int frame_air_ms_cache_ = 0;
+    uint64_t frame_air_key_ = (uint64_t)-1;
     
     std::unique_ptr<Encoder48k> encoder_;
     std::unique_ptr<Decoder48k> decoder_;
@@ -1188,6 +1328,7 @@ private:
     mutable std::mutex lockout_mutex_;
     std::chrono::steady_clock::time_point tx_lockout_until_;
     static constexpr float RX_LOCKOUT_SECONDS = 0.5f;
+    std::atomic<int64_t> last_rx_done_ms_{0};
     
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
@@ -1203,6 +1344,11 @@ public:
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
             config_.slot_time_ms = new_config.slot_time_ms;
+            config_.csma_quiet_ms = new_config.csma_quiet_ms;
+            config_.csma_cw = new_config.csma_cw;
+            config_.csma_responder_dither = new_config.csma_responder_dither;
+            config_.csma_burst = new_config.csma_burst;
+            config_.tx_lead_tone = new_config.tx_lead_tone;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
         }
         
@@ -1331,6 +1477,8 @@ public:
     }
 
     bool is_transmitting() const { return tx_blanking_active_.load(); }
+
+    size_t tx_queue_depth() const { return tx_queue_.size(); }
 
     bool is_receiving() const {
         std::lock_guard<std::mutex> lock(lockout_mutex_);
@@ -1464,6 +1612,11 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
+        else if (!strcmp(key, "csma_quiet_ms") && take(key)) config.csma_quiet_ms = atoi(value);
+        else if (!strcmp(key, "csma_cw") && take(key)) config.csma_cw = atoi(value);
+        else if (!strcmp(key, "csma_responder_dither") && take(key)) config.csma_responder_dither = atoi(value);
+        else if (!strcmp(key, "csma_burst") && take(key)) config.csma_burst = atoi(value);
+        else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
         else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
@@ -1538,7 +1691,12 @@ void print_help(const char* prog) {
               << "  --no-csma               Disable CSMA carrier sense\n"
               << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
               << "  --csma-slot MS          Slot time in ms (default: 500)\n"
-              << "  --csma-persist N        P-persistence 0-255 (default: 128 = 50%)\n"
+              << "  --csma-quiet MS         Idle time before contending (default: 0 = auto from frame airtime)\n"
+              << "  --csma-cw N             Contention window in slots (default: 8)\n"
+              << "  --csma-dither MS        Responder delay spread from callsign hash (default: 0 = off)\n"
+              << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 1)\n"
+              << "  --lead-tone             Send tone during TXDelay so others detect keyup (SSB)\n"
+              << "  --csma-persist N        P-persistence 0-255 (deprecated, unused)\n"
               << "\nFragmentation:\n"
               << "  --frag                  Enable packet fragmentation/reassembly\n"
               << "  --no-frag               Disable fragmentation (default)\n"
@@ -1761,6 +1919,21 @@ int main(int argc, char** argv) {
         } else if (arg == "--csma-slot" && i + 1 < argc) {
             config.slot_time_ms = std::atoi(argv[++i]);
             cli_set.insert("slot_time_ms");
+        } else if (arg == "--csma-quiet" && i + 1 < argc) {
+            config.csma_quiet_ms = std::atoi(argv[++i]);
+            cli_set.insert("csma_quiet_ms");
+        } else if (arg == "--csma-cw" && i + 1 < argc) {
+            config.csma_cw = std::atoi(argv[++i]);
+            cli_set.insert("csma_cw");
+        } else if (arg == "--csma-dither" && i + 1 < argc) {
+            config.csma_responder_dither = std::atoi(argv[++i]);
+            cli_set.insert("csma_responder_dither");
+        } else if (arg == "--csma-burst" && i + 1 < argc) {
+            config.csma_burst = std::atoi(argv[++i]);
+            cli_set.insert("csma_burst");
+        } else if (arg == "--lead-tone") {
+            config.tx_lead_tone = true;
+            cli_set.insert("tx_lead_tone");
         } else if (arg == "--csma-persist" && i + 1 < argc) {
             config.p_persistence = std::atoi(argv[++i]);
             cli_set.insert("p_persistence");
@@ -1847,6 +2020,11 @@ int main(int argc, char** argv) {
                 config.csma_enabled = ui_state.csma_enabled;
                 config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 config.slot_time_ms = ui_state.slot_time_ms;
+                config.csma_quiet_ms = ui_state.csma_quiet_ms;
+                config.csma_cw = ui_state.csma_cw;
+                config.csma_responder_dither = ui_state.csma_responder_dither;
+                config.csma_burst = ui_state.csma_burst;
+                config.tx_lead_tone = ui_state.tx_lead_tone;
                 config.p_persistence = ui_state.p_persistence;
                 config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
@@ -1903,6 +2081,11 @@ int main(int argc, char** argv) {
                 ui_state.csma_enabled = config.csma_enabled;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
+                ui_state.csma_quiet_ms = config.csma_quiet_ms;
+                ui_state.csma_cw = config.csma_cw;
+                ui_state.csma_responder_dither = config.csma_responder_dither;
+                ui_state.csma_burst = config.csma_burst;
+                ui_state.tx_lead_tone = config.tx_lead_tone;
                 ui_state.p_persistence = config.p_persistence;
                 ui_state.frame_size = config.frame_size;
                 ui_state.postamble = config.postamble;
@@ -2061,6 +2244,7 @@ int main(int argc, char** argv) {
                 cJSON_AddStringToObject(j, "channel_state", state);
 
                 cJSON_AddBoolToObject(j, "ptt_on", tnc.is_transmitting());
+                cJSON_AddNumberToObject(j, "tx_queue", (double)tnc.tx_queue_depth());
                 cJSON_AddNumberToObject(j, "rx_frame_count", stats.sync_count - stats.preamble_errors - stats.crc_errors);
                 cJSON_AddNumberToObject(j, "tx_frame_count", 0); // TODO: add tx counter to KISSTNC
                 cJSON_AddNumberToObject(j, "rx_error_count", stats.preamble_errors + stats.crc_errors);
@@ -2107,6 +2291,11 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
+                cJSON_AddNumberToObject(j, "csma_quiet_ms", cfg.csma_quiet_ms);
+                cJSON_AddNumberToObject(j, "csma_cw", cfg.csma_cw);
+                cJSON_AddNumberToObject(j, "csma_responder_dither", cfg.csma_responder_dither);
+                cJSON_AddNumberToObject(j, "csma_burst", cfg.csma_burst);
+                cJSON_AddBoolToObject(j, "tx_lead_tone", cfg.tx_lead_tone);
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
                 cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
                 cJSON_AddBoolToObject(j, "mfsk_rx_enabled", cfg.mfsk_rx_enabled);
@@ -2150,6 +2339,16 @@ int main(int argc, char** argv) {
                     new_config.p_persistence = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "slot_time_ms")) && cJSON_IsNumber(item))
                     new_config.slot_time_ms = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_quiet_ms")) && cJSON_IsNumber(item))
+                    new_config.csma_quiet_ms = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_cw")) && cJSON_IsNumber(item))
+                    new_config.csma_cw = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_responder_dither")) && cJSON_IsNumber(item))
+                    new_config.csma_responder_dither = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_burst")) && cJSON_IsNumber(item))
+                    new_config.csma_burst = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_lead_tone")) && cJSON_IsBool(item))
+                    new_config.tx_lead_tone = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_blanking_enabled")) && cJSON_IsBool(item))
                     new_config.tx_blanking_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "fragmentation_enabled")) && cJSON_IsBool(item))
@@ -2226,6 +2425,11 @@ int main(int argc, char** argv) {
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;
+                new_config.csma_quiet_ms = state.csma_quiet_ms;
+                new_config.csma_cw = state.csma_cw;
+                new_config.csma_responder_dither = state.csma_responder_dither;
+                new_config.csma_burst = state.csma_burst;
+                new_config.tx_lead_tone = state.tx_lead_tone;
                 new_config.fragmentation_enabled = state.fragmentation_enabled;
                 new_config.tx_blanking_enabled = state.tx_blanking_enabled;
                 new_config.audio_input_device = state.audio_input_device;

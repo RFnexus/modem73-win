@@ -21,3 +21,4 @@ test_e2e.cc
 test_suite/
 __pycache__
 audio_samples/
+modem73_sample.wav
