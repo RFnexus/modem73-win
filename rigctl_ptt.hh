@@ -4,12 +4,8 @@
 #include <iostream>
 #include <cstring>
 #include <mutex>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <netdb.h>
-#include <poll.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 class RigctlPTT {
 public:
@@ -41,7 +37,7 @@ public:
         // T 1 (PTT on) or T 0 (PTT off)
         std::string cmd = on ? "T 1\n" : "T 0\n";
 
-        if (send(sock_, cmd.c_str(), cmd.length(), 0) < 0) {
+        if (send(sock_, cmd.c_str(), (int)cmd.length(), 0) < 0) {
             std::cerr << "rigctl: Failed to send PTT command" << std::endl;
             disconnect_locked();
             return false;
@@ -75,7 +71,7 @@ public:
         }
 
         std::string wire = cmd + "\n";
-        if (::send(sock_, wire.c_str(), wire.length(), 0) < 0) {
+        if (::send(sock_, wire.c_str(), (int)wire.length(), 0) < 0) {
             disconnect_locked();
             return "ERR: send failed";
         }
@@ -83,10 +79,10 @@ public:
         // Read response with timeout
         std::string result;
         char buf[1024];
-        struct pollfd pfd = {sock_, POLLIN, 0};
+        WSAPOLLFD pfd = {sock_, POLLIN, 0};
 
         while (true) {
-            int ready = poll(&pfd, 1, 500);
+            int ready = WSAPoll(&pfd, 1, 500);
             if (ready <= 0) break;
             int n = recv(sock_, buf, sizeof(buf) - 1, 0);
             if (n <= 0) break;
@@ -109,7 +105,7 @@ private:
         if (connected_) return true;
 
         sock_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock_ < 0) {
+        if (sock_ == INVALID_SOCKET) {
             std::cerr << "rigctl: Failed to create socket" << std::endl;
             return false;
         }
@@ -117,8 +113,8 @@ private:
         struct hostent* server = gethostbyname(host_.c_str());
         if (!server) {
             std::cerr << "rigctl PTT: Can't connect to host " << host_ << std::endl;
-            close(sock_);
-            sock_ = -1;
+            closesocket(sock_);
+            sock_ = INVALID_SOCKET;
             return false;
         }
 
@@ -129,31 +125,32 @@ private:
         addr.sin_port = htons(port_);
 
 
-        int flags = fcntl(sock_, F_GETFL, 0);
-        fcntl(sock_, F_SETFL, flags | O_NONBLOCK);
+        u_long nb = 1;
+        ioctlsocket(sock_, FIONBIO, &nb);
         int rc = ::connect(sock_, (struct sockaddr*)&addr, sizeof(addr));
-        if (rc < 0 && errno == EINPROGRESS) {
+        if (rc < 0 && WSAGetLastError() == WSAEWOULDBLOCK) {
             fd_set wf;
             FD_ZERO(&wf);
             FD_SET(sock_, &wf);
             struct timeval tv = {2, 0};
-            rc = (select(sock_ + 1, nullptr, &wf, nullptr, &tv) == 1) ? 0 : -1;
+            rc = (select(0, nullptr, &wf, nullptr, &tv) == 1) ? 0 : -1;
             if (rc == 0) {
                 int err = 0;
                 socklen_t elen = sizeof(err);
-                getsockopt(sock_, SOL_SOCKET, SO_ERROR, &err, &elen);
+                getsockopt(sock_, SOL_SOCKET, SO_ERROR, (char*)&err, &elen);
                 if (err) rc = -1;
             }
         }
         if (rc < 0) {
             std::cerr << "rigctl: Can't connect to " << host_ << ":" << port_ << std::endl;
-            close(sock_);
-            sock_ = -1;
+            closesocket(sock_);
+            sock_ = INVALID_SOCKET;
             return false;
         }
-        fcntl(sock_, F_SETFL, flags);
-        struct timeval rto = {2, 0};
-        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, &rto, sizeof(rto));
+        nb = 0;
+        ioctlsocket(sock_, FIONBIO, &nb);
+        DWORD rto = 2000;
+        setsockopt(sock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rto, sizeof(rto));
 
         connected_ = true;
         std::cerr << "rigctl: Connected to " << host_ << ":" << port_ << std::endl;
@@ -161,9 +158,9 @@ private:
     }
 
     void disconnect_locked() {
-        if (sock_ >= 0) {
-            close(sock_);
-            sock_ = -1;
+        if (sock_ != INVALID_SOCKET) {
+            closesocket(sock_);
+            sock_ = INVALID_SOCKET;
         }
         connected_ = false;
         ptt_on_ = false;
@@ -171,7 +168,7 @@ private:
 
     std::string host_;
     int port_;
-    int sock_ = -1;
+    SOCKET sock_ = INVALID_SOCKET;
     bool connected_ = false;
     bool ptt_on_ = false;
     std::mutex mutex_;

@@ -8,7 +8,12 @@
 </p>
 
 
-MODEM73 is an open source software modem that works with any HF, VHF, or UHF radio capable of 2400 Hz of bandwidth. All you need is a sound card and audio cable for your radio.  
+MODEM73 is an open source software modem that works with any HF, VHF, or UHF radio capable of 2400 Hz of bandwidth. All you need is a sound card and audio cable for your radio.
+
+
+### NOTE:
+
+This fork of the modem73 upstream uses LLM assisted tooling for porting the upstream modem73 to Win32 exclusive APIs and PDcurses.  As such this repo is  experimental. It's recommended to use the upstream modem73 with WSL, or switch to an operating system that [respects your privacy and autonomy as a human](https://www.youtube.com/watch?v=n8vmXvoVjZw). 
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
 <p>
@@ -42,52 +47,25 @@ Hit "Start microphone" to begin decoding
 
 ## Building from source
 
-### Linux
+Everything is vendored under `deps/` (aicodix DSP, PDCurses, hidapi, miniaudio, cJSON) and the exe is statically linked, so no external libraries are needed at build or run time. CM108 USB PTT is always enabled.
 
-On a system with `apt`? Run the installer script:
-```
-./install.sh
-```
---- 
+### Native on Windows (MSYS2)
 
-1. Install dependencies
-
+Install [MSYS2](https://www.msys2.org/), then in a MinGW64 shell:
 ```
-# Debian/Ubuntu/Pi
-sudo apt install git build-essential libncurses-dev g++
+pacman -S --needed make mingw-w64-x86_64-gcc
+make CXX=g++ CC=gcc
 ```
 
-
-#### Optional Addons
-
-
-##### CM108 USB PTT Support
-
-CM108-based USB audio interfaces have GPIO pins that can be used for PTT control. To enable CM108 support, install libhidapi-dev before building. The Makefile will auto-detect it and enable the feature.
-```
-# Debian/Ubuntu/Pi - install before building 
-sudo apt install libhidapi-dev
-```
-----
-2. Clone aiocdix DSP libraries and build.
-
-
+### Cross-compile from Linux
 
 ```
-# Clone modem73
-
-git clone https://github.com/RFnexus/modem73
-
-# Build
-
-cd modem73
-make 
-
-# Optional: move to /usr/local/bin 
-sudo make install 
+# Debian/Ubuntu
+sudo apt install make g++-mingw-w64-x86-64-posix
+make
 ```
 
-and run `./modem73`
+and run `modem73.exe`
 
 ## Running & Operations
 
@@ -105,38 +83,38 @@ There are currently five PTT options:
 
 ```
 # Start in UI mode
-./modem73
+modem73.exe
 
 # Start in headless mode
-./modem73 --headless
+modem73.exe --headless
 
 # See all options with:
-./modem73 --help
+modem73.exe --help
 ```
 
 ### PTT options 
 
 ```
 # Connect to rigctld for PTT control
-./modem73 --rigctl localhost:4532
+modem73.exe --rigctl localhost:4532
 ```
 
 while running `rigctld`
 
 
 ```
-./modem73 --ptt vox --vox-freq 1200 --vox-lead 500 --vox-tail 150
+modem73.exe --ptt vox --vox-freq 1200 --vox-lead 500 --vox-tail 150
 # 500ms vox lead and 150ms vox tail
 ```
 
 
 ```
-./modem73 --ptt com --com-port /dev/ttyUSB0 --com-line rts
+modem73.exe --ptt com --com-port COM4 --com-line rts
 ```
 
 ```
 # CM108 USB audio interface PTT (GPIO3 is the default)
-./modem73 --ptt cm108 --cm108-gpio 3
+modem73.exe --ptt cm108 --cm108-gpio 3
 ```
 
 ### Control port
@@ -147,16 +125,16 @@ A control port for modem73 will automatically start on port `8073` by default. V
 <img width="1092" height="847" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
 
 ### All In One Audio Cable (AIOC)
-modem73 supports the [AIOC](https://github.com/skuep/AIOC) out of the box. To use the All In One Audio cable, set PTT to COM, specify your COM port, and set PTT line to `BOTH` and Invert to `INVERT RTS`. Make sure you have the correct permissions and `/dev/xxxx` specified. The AIOC on most setups will be /dev/ttyACMx (where x is 0, 1, 2). Note that it may change after a device restart, plugging it back in, etc. 
+modem73 supports the [AIOC](https://github.com/skuep/AIOC) out of the box. To use the All In One Audio cable, set PTT to COM, specify your COM port, and set PTT line to `BOTH` and Invert to `INVERT RTS`. Check Device Manager for the COM number (e.g. COM5). Note that it may change after a device restart, plugging it back in, etc.
 
 ### rigctl
-modem73 supports Hamlib and rigctl for any rigctl supported radio for PTT. Set rigctl to your options and run `rigctld -m (your model) -s (serial baud rate) -r /dev/XXXX)`  The `d` at the end of `rigctl` tells rigctl to run in network mode, which is what modem73 will connect to.
+modem73 supports Hamlib and rigctl for any rigctl supported radio for PTT. Set rigctl to your options and run `rigctld -m (your model) -s (serial baud rate) -r COMx`  The `d` at the end of `rigctl` tells rigctl to run in network mode, which is what modem73 will connect to.
 
 ### Reticulum
 Want to use modem73 with Reticulum? Check out the modem73interface
 https://github.com/RFnexus/modem73interface
 
-Drop it into `~/.reticulum/interfaces/` and in your Reticulum config, add something like:
+Drop it into `%USERPROFILE%\.reticulum\interfaces\` and in your Reticulum config, add something like:
 ```
 [[MODEM73]]
 type = Modem73Interface
@@ -167,14 +145,6 @@ control_host = 127.0.0.1
 control_port = 8073
 ```
 
+## Settings
 
-
-
-## Updating
-
-modem73 comes included with a update utility `update.sh`
-
-To update to the latest version:
-```
-./update.sh
-```
+Settings, presets, and the performance log are stored in `%APPDATA%\modem73\`.

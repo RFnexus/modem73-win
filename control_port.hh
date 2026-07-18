@@ -10,13 +10,8 @@
 #include <cstring>
 #include <iostream>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 extern "C" {
 #include "deps/cJSON.h"
@@ -78,40 +73,41 @@ public:
 
     bool start() {
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0) {
+        if (server_fd_ == INVALID_SOCKET) {
             std::cerr << "control: Failed to create socket" << std::endl;
             return false;
         }
 
         int opt = 1;
-        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        setsockopt(server_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&opt, sizeof(opt));
 
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         if (inet_pton(AF_INET, bind_address_.c_str(), &addr.sin_addr) != 1) {
             std::cerr << "control: invalid bind address " << bind_address_ << std::endl;
-            close(server_fd_);
-            server_fd_ = -1;
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
             return false;
         }
         addr.sin_port = htons(port_);
 
         if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
             std::cerr << "control: Failed to bind to port " << port_ << std::endl;
-            close(server_fd_);
-            server_fd_ = -1;
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
             return false;
         }
 
         if (listen(server_fd_, 5) < 0) {
             std::cerr << "control: Failed to listen" << std::endl;
-            close(server_fd_);
-            server_fd_ = -1;
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
             return false;
         }
 
-        fcntl(server_fd_, F_SETFL, O_NONBLOCK);
+        u_long nb = 1;
+        ioctlsocket(server_fd_, FIONBIO, &nb);
 
         running_ = true;
         thread_ = std::thread(&ControlPort::run, this);
@@ -125,9 +121,9 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
-        if (server_fd_ >= 0) {
-            close(server_fd_);
-            server_fd_ = -1;
+        if (server_fd_ != INVALID_SOCKET) {
+            closesocket(server_fd_);
+            server_fd_ = INVALID_SOCKET;
         }
     }
 
@@ -169,8 +165,8 @@ public:
 
         std::lock_guard<std::recursive_mutex> lock(clients_mutex_);
         for (auto& client : clients_) {
-            ::send(client.fd, header, 4, MSG_NOSIGNAL);
-            ::send(client.fd, str, len, MSG_NOSIGNAL);
+            ::send(client.fd, (const char*)header, 4, 0);
+            ::send(client.fd, str, len, 0);
         }
 
         cJSON_free(str);
@@ -178,10 +174,10 @@ public:
 
 private:
     struct Client {
-        int fd;
+        SOCKET fd;
         std::vector<uint8_t> recv_buf;
 
-        Client(int fd) : fd(fd) {}
+        Client(SOCKET fd) : fd(fd) {}
     };
 
     void run() {
@@ -189,12 +185,13 @@ private:
             // Accept new connections
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
+            SOCKET client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
 
-            if (client_fd >= 0) {
+            if (client_fd != INVALID_SOCKET) {
                 int flag = 1;
-                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-                fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+                u_long nb = 1;
+                ioctlsocket(client_fd, FIONBIO, &nb);
 
                 char ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
@@ -211,14 +208,14 @@ private:
                 std::lock_guard<std::recursive_mutex> lock(clients_mutex_);
                 for (auto it = clients_.begin(); it != clients_.end();) {
                     uint8_t buf[4096];
-                    ssize_t n = recv(it->fd, buf, sizeof(buf), MSG_DONTWAIT);
+                    int n = recv(it->fd, (char*)buf, sizeof(buf), 0);
 
                     if (n > 0) {
                         it->recv_buf.insert(it->recv_buf.end(), buf, buf + n);
                         process_recv_buf(*it);
-                    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    } else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK)) {
                         std::cerr << "control: Client disconnected" << std::endl;
-                        close(it->fd);
+                        closesocket(it->fd);
                         it = clients_.erase(it);
                         continue;
                     }
@@ -234,7 +231,7 @@ private:
         {
             std::lock_guard<std::recursive_mutex> lock(clients_mutex_);
             for (auto& client : clients_) {
-                close(client.fd);
+                closesocket(client.fd);
             }
             clients_.clear();
         }
@@ -269,7 +266,7 @@ private:
         }
     }
 
-    void handle_message(int client_fd, const std::string& json_str) {
+    void handle_message(SOCKET client_fd, const std::string& json_str) {
         cJSON* request = cJSON_Parse(json_str.c_str());
         if (!request) {
             send_error(client_fd, "invalid JSON");
@@ -302,7 +299,7 @@ private:
         cJSON_Delete(request);
     }
 
-    void handle_get_status(int client_fd) {
+    void handle_get_status(SOCKET client_fd) {
         if (!iface_.get_status) {
             send_error(client_fd, "get_status not available");
             return;
@@ -317,7 +314,7 @@ private:
         }
     }
 
-    void handle_get_config(int client_fd) {
+    void handle_get_config(SOCKET client_fd) {
         if (!iface_.get_config) {
             send_error(client_fd, "get_config not available");
             return;
@@ -332,7 +329,7 @@ private:
         }
     }
 
-    void handle_set_config(int client_fd, cJSON* request) {
+    void handle_set_config(SOCKET client_fd, cJSON* request) {
         if (!iface_.set_config) {
             send_error(client_fd, "set_config not available");
             return;
@@ -348,7 +345,7 @@ private:
         }
     }
 
-    void handle_rigctl(int client_fd, cJSON* request) {
+    void handle_rigctl(SOCKET client_fd, cJSON* request) {
         if (!iface_.rigctl_command) {
             send_error(client_fd, "rigctl not available");
             return;
@@ -369,7 +366,7 @@ private:
         cJSON_Delete(response);
     }
 
-    void handle_tx(int client_fd, cJSON* request) {
+    void handle_tx(SOCKET client_fd, cJSON* request) {
         if (!iface_.tx_data) {
             send_error(client_fd, "tx not available");
             return;
@@ -405,7 +402,7 @@ private:
         }
     }
 
-    void send_json(int client_fd, cJSON* json) {
+    void send_json(SOCKET client_fd, cJSON* json) {
         char* str = cJSON_PrintUnformatted(json);
         if (!str) return;
 
@@ -417,13 +414,13 @@ private:
         header[3] = len & 0xFF;
 
         // Send header + body (best effort, non-blocking)
-        ::send(client_fd, header, 4, MSG_NOSIGNAL);
-        ::send(client_fd, str, len, MSG_NOSIGNAL);
+        ::send(client_fd, (const char*)header, 4, 0);
+        ::send(client_fd, str, len, 0);
 
         cJSON_free(str);
     }
 
-    void send_error(int client_fd, const char* error) {
+    void send_error(SOCKET client_fd, const char* error) {
         cJSON* response = cJSON_CreateObject();
         cJSON_AddBoolToObject(response, "ok", 0);
         cJSON_AddStringToObject(response, "error", error);
@@ -434,7 +431,7 @@ private:
     int port_;
     std::string bind_address_;
     TNCInterface iface_;
-    int server_fd_ = -1;
+    SOCKET server_fd_ = INVALID_SOCKET;
     std::atomic<bool> running_{false};
     std::thread thread_;
     std::recursive_mutex clients_mutex_;

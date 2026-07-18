@@ -5,14 +5,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cwchar>
-#include <fcntl.h>
-#include <unistd.h>
-#include <termios.h>
 #include <cerrno>
 #include <cstring>
 #include <iostream>
 
-#include <hidapi/hidapi.h>
+#include "deps/hidapi/hidapi.h"
 
 class CM108PTT {
 public:

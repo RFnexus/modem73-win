@@ -19,14 +19,13 @@
 #include <cctype>
 
 // Network
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <poll.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <direct.h>
+
+// windows.h SAL macros clash with aicodix template parameters
+#undef IN
+#undef OUT
 
 // Local includes
 #include "kiss_tnc.hh"
@@ -84,25 +83,25 @@ bool valid_bind_address(const std::string& addr) {
 }
 
 bool check_port_available(const std::string& bind_address, int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
+    SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock == INVALID_SOCKET) {
         return false;
     }
 
     int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(sock, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     if (inet_pton(AF_INET, bind_address.c_str(), &addr.sin_addr) != 1) {
-        close(sock);
+        closesocket(sock);
         return false;
     }
     addr.sin_port = htons(port);
 
     int result = bind(sock, (struct sockaddr*)&addr, sizeof(addr));
-    close(sock);
+    closesocket(sock);
 
     return result == 0;
 }
@@ -112,15 +111,15 @@ bool check_port_available(const std::string& bind_address, int port) {
 
 class ClientConnection {
 public:
-    int fd;
+    SOCKET fd;
     KISSParser parser;
     std::vector<uint8_t> write_buffer;
     std::mutex write_mutex;
     bool connected = true;
-    
-    ClientConnection(int fd, std::function<void(uint8_t, uint8_t, const std::vector<uint8_t>&)> callback)
+
+    ClientConnection(SOCKET fd, std::function<void(uint8_t, uint8_t, const std::vector<uint8_t>&)> callback)
         : fd(fd), parser(callback) {}
-    
+
     static constexpr size_t MAX_WRITE_BUFFER = 1024 * 1024;
 
     void send(const std::vector<uint8_t>& data) {
@@ -129,14 +128,14 @@ public:
             return;
         write_buffer.insert(write_buffer.end(), data.begin(), data.end());
     }
-    
+
     bool flush() {
         std::lock_guard<std::mutex> lock(write_mutex);
         if (write_buffer.empty()) return true;
-        
-        ssize_t sent = ::send(fd, write_buffer.data(), write_buffer.size(), MSG_NOSIGNAL);
+
+        int sent = ::send(fd, (const char*)write_buffer.data(), (int)write_buffer.size(), 0);
         if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+            if (WSAGetLastError() == WSAEWOULDBLOCK) return true;
             return false;
         }
         write_buffer.erase(write_buffer.begin(), write_buffer.begin() + sent);
@@ -291,33 +290,34 @@ public:
         }
         
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (server_fd_ < 0) {
+        if (server_fd_ == INVALID_SOCKET) {
             throw std::runtime_error("Failed to create socket");
         }
-        
+
         int opt = 1;
-        setsockopt(server_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-        
+        setsockopt(server_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&opt, sizeof(opt));
+
         struct sockaddr_in addr;
         memset(&addr, 0, sizeof(addr));
         addr.sin_family = AF_INET;
         if (inet_pton(AF_INET, config_.bind_address.c_str(), &addr.sin_addr) != 1) {
-            close(server_fd_);
+            closesocket(server_fd_);
             throw std::runtime_error("Invalid bind address: " + config_.bind_address);
         }
         addr.sin_port = htons(config_.port);
 
         if (bind(server_fd_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(server_fd_);
+            closesocket(server_fd_);
             throw std::runtime_error("Failed to bind to port " + std::to_string(config_.port));
         }
-        
+
         if (listen(server_fd_, 5) < 0) {
-            close(server_fd_);
+            closesocket(server_fd_);
             throw std::runtime_error("Failed to listen");
         }
-        
-        fcntl(server_fd_, F_SETFL, O_NONBLOCK);
+
+        u_long nb = 1;
+        ioctlsocket(server_fd_, FIONBIO, &nb);
         
         std::cerr << "KISS TNC listening on " << config_.bind_address << ":" << config_.port << std::endl;
         std::cerr << "Callsign: " << config_.callsign << std::endl;
@@ -373,24 +373,25 @@ public:
         while (g_running) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
-            int client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
-            
-            if (client_fd >= 0) {
+            SOCKET client_fd = accept(server_fd_, (struct sockaddr*)&client_addr, &client_len);
+
+            if (client_fd != INVALID_SOCKET) {
                 {
                     std::lock_guard<std::mutex> lock(clients_mutex_);
                     if (clients_.size() >= MAX_CLIENTS) {
                         ui_log("KISS: client limit reached, rejecting connection");
-                        close(client_fd);
-                        client_fd = -1;
+                        closesocket(client_fd);
+                        client_fd = INVALID_SOCKET;
                     }
                 }
             }
 
-            if (client_fd >= 0) {
+            if (client_fd != INVALID_SOCKET) {
                 // Set TCP_NODELAY
                 int flag = 1;
-                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
-                fcntl(client_fd, F_SETFL, O_NONBLOCK);
+                setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&flag, sizeof(flag));
+                u_long cnb = 1;
+                ioctlsocket(client_fd, FIONBIO, &cnb);
 
                 char ip_str[INET_ADDRSTRLEN];
                 inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
@@ -418,14 +419,14 @@ public:
                     
                     // Read data
                     uint8_t buf[4096];
-                    ssize_t n = recv(client->fd, buf, sizeof(buf), MSG_DONTWAIT);
-                    
+                    int n = recv(client->fd, (char*)buf, sizeof(buf), 0);
+
                     if (n > 0) {
                         client->parser.process(buf, n);
-                    } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    } else if (n == 0 || (n < 0 && WSAGetLastError() != WSAEWOULDBLOCK)) {
                         // Disconnected
                         ui_log("Client disconnected");
-                        close(client->fd);
+                        closesocket(client->fd);
                         it = clients_.erase(it);
 #ifdef WITH_UI
                         if (g_ui_state) {
@@ -438,7 +439,7 @@ public:
                     // Flush write buffer
                     if (!client->flush()) {
                         ui_log("Client write error, disconnecting");
-                        close(client->fd);
+                        closesocket(client->fd);
                         it = clients_.erase(it);
 #ifdef WITH_UI
                         if (g_ui_state) {
@@ -466,9 +467,9 @@ public:
         set_ptt(false);
 
         for (auto& client : clients_) {
-            close(client->fd);
+            closesocket(client->fd);
         }
-        close(server_fd_);
+        closesocket(server_fd_);
     }
     
 private:
@@ -1507,7 +1508,7 @@ private:
     std::unique_ptr<DummyPTT> dummy_ptt_;
     
     static constexpr size_t MAX_CLIENTS = 16;
-    int server_fd_ = -1;
+    SOCKET server_fd_ = INVALID_SOCKET;
     std::list<std::unique_ptr<ClientConnection>> clients_;
     mutable std::mutex clients_mutex_;
     
@@ -1973,7 +1974,7 @@ void print_help(const char* prog) {
 #endif
               << " (default: rigctl)\n"
               << "  --rigctl HOST:PORT      Rigctl address (default: localhost:4532)\n"
-              << "  --com-port PORT         Serial port for COM PTT (default: /dev/ttyUSB0)\n"
+              << "  --com-port PORT         Serial port for COM PTT (default: COM1)\n"
               << "  --com-line LINE         COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
               << "  --vox-freq HZ           VOX tone frequency (default: 1200)\n"
@@ -2013,13 +2014,19 @@ void print_help(const char* prog) {
 #endif
               << "  -v, --verbose           Verbose output\n"
               << "  --config [FILE]         Load options from FILE\n"
-              << "                          (defaults to ~/.config/modem73/settings)\n"
+              << "                          (defaults to %APPDATA%\\modem73\\settings)\n"
               << "  --help                  Show this help\n"
-              << "\nSettings are saved to ~/.config/modem73/settings\n";
+              << "\nSettings are saved to %APPDATA%\\modem73\\settings\n";
 }
 
 int main(int argc, char** argv) {
     std::cerr << "MODEM73 build " << __DATE__ << " " << __TIME__ << std::endl;
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "WSAStartup failed" << std::endl;
+        return 1;
+    }
 
     TNCConfig config;
 
@@ -2086,9 +2093,9 @@ int main(int argc, char** argv) {
             if (i + 1 < argc && argv[i + 1][0] != '-') {
                 config.config_file = argv[++i];
             } else {
-                const char* home = getenv("HOME");
-                if (home) {
-                    config.config_file = std::string(home) + "/.config/modem73/settings";
+                const char* appdata = getenv("APPDATA");
+                if (appdata) {
+                    config.config_file = std::string(appdata) + "\\modem73\\settings";
                 }
             }
         } else if ((arg == "-d" || arg == "--device") && i + 1 < argc) {
@@ -2274,7 +2281,6 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
 
     if (!g_use_ui && cli_config && !config.config_file.empty()) {
         if (apply_settings_file(config.config_file, config, cli_set)) {
@@ -2290,14 +2296,14 @@ int main(int argc, char** argv) {
         g_ui_state = &ui_state;
         
         // Set up config file path
-        const char* home = getenv("HOME");
-        if (home) {
-            std::string config_dir = std::string(home) + "/.config/modem73";
-            mkdir(config_dir.c_str(), 0755);
+        const char* appdata = getenv("APPDATA");
+        if (appdata) {
+            std::string config_dir = std::string(appdata) + "\\modem73";
+            _mkdir(config_dir.c_str());
             ui_state.config_file = cli_config && !config.config_file.empty()
                                        ? config.config_file
-                                       : config_dir + "/settings";
-            ui_state.presets_file = config_dir + "/presets";
+                                       : config_dir + "\\settings";
+            ui_state.presets_file = config_dir + "\\presets";
             
             auto input_devices = MiniAudio::list_capture_devices();
             for (const auto& dev : input_devices) {

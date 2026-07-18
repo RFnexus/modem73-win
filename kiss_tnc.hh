@@ -78,8 +78,8 @@ struct TNCConfig {
     int vox_lead_ms = 550;       // ms - tone before OFDM data
     int vox_tail_ms = 500;       // ms - tone after OFDM data
     
-    // COM/Serial PTT settings 
-    std::string com_port = "/dev/ttyUSB0"; 
+    // COM/Serial PTT settings
+    std::string com_port = "COM1";
     int com_ptt_line = 1;        // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;

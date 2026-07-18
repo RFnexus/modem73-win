@@ -1,7 +1,8 @@
 #pragma once
 
 #include <locale.h>
-#include <ncurses.h>
+#define PDC_NCMOUSE
+#include <curses.h>
 #include <string>
 #include <vector>
 #include <deque>
@@ -21,7 +22,7 @@
 #include <cstdlib>
 #include <algorithm>
 #include <random>
-#include <unistd.h>
+#include <io.h>
 #include <fcntl.h>
 
 #include "kiss_tnc.hh"
@@ -242,7 +243,7 @@ struct TNCUIState {
     int vox_tail_ms = 100;      // ms
     
     // COM/Serial PTT settings (PTT type 3)
-    std::string com_port = "/dev/ttyUSB0";
+    std::string com_port = "COM1";
     int com_ptt_line = 1;       // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
@@ -1188,23 +1189,23 @@ public:
         }
 
         if (saved_stderr_ >= 0) {
-            dup2(saved_stderr_, STDERR_FILENO);
-            close(saved_stderr_);
+            _dup2(saved_stderr_, 2);
+            _close(saved_stderr_);
         }
     }
-    
-    void run() {
-        // set locale LC_ALL for Unicode character support,  
-        setlocale(LC_ALL, "");
-        
 
-        saved_stderr_ = dup(STDERR_FILENO);
-        int devnull = open("/dev/null", O_WRONLY);
+    void run() {
+        // set locale LC_ALL for Unicode character support,
+        setlocale(LC_ALL, "");
+
+
+        saved_stderr_ = _dup(2);
+        int devnull = _open("NUL", _O_WRONLY);
         if (devnull >= 0) {
-            dup2(devnull, STDERR_FILENO);
-            close(devnull);
+            _dup2(devnull, 2);
+            _close(devnull);
         }
-        
+
         initscr();
         initialized_ = true;
         cbreak();
@@ -1212,8 +1213,7 @@ public:
         keypad(stdscr, TRUE);
         nodelay(stdscr, TRUE);
         curs_set(0);
-        set_escdelay(25);
-        
+
         mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
         mouseinterval(0);
         
@@ -1243,11 +1243,11 @@ public:
         
         endwin();
         initialized_ = false;
-        
+
 
         if (saved_stderr_ >= 0) {
-            dup2(saved_stderr_, STDERR_FILENO);
-            close(saved_stderr_);
+            _dup2(saved_stderr_, 2);
+            _close(saved_stderr_);
             saved_stderr_ = -1;
         }
     }
@@ -2674,7 +2674,7 @@ private:
             auto now = std::chrono::system_clock::now();
             auto t = std::chrono::system_clock::to_time_t(now);
             struct tm lt;
-            localtime_r(&t, &lt);
+            localtime_s(&lt, &t);
             attron(A_BOLD);
             mvprintw(0, cols - 31, "%02d:%02d:%02d", lt.tm_hour, lt.tm_min, lt.tm_sec);
             attroff(A_BOLD);
