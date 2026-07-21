@@ -3,6 +3,13 @@
 #include <locale.h>
 #define PDC_NCMOUSE
 #include <curses.h>
+
+// PDCurses wincon internals (deps/pdcurses/wincon/pdcgetsc.c): the live
+// console viewport size.  Needed to detect window resizes that never queue
+// a WINDOW_BUFFER_SIZE_EVENT (conhost only sends one when the screen
+// *buffer* changes, and its buffer can be scrollback-sized).
+extern "C" int PDC_get_rows(void);
+extern "C" int PDC_get_columns(void);
 #include <string>
 #include <vector>
 #include <deque>
@@ -1239,7 +1246,11 @@ public:
         }
         
         running_ = true;
-        
+
+        // marker so a running build can be identified as resize-aware
+        state_.add_log("UI: console resize watch active (" +
+                       std::to_string(COLS) + "x" + std::to_string(LINES) + ")");
+
         while (running_ && g_running) {
             int ch = getch();
             if (handle_resize(ch)) {
@@ -1247,6 +1258,8 @@ public:
             } else if (ch != ERR) {
                 handle_input(ch);
             }
+            if (poll_resize())
+                clear();
             tick_auto_send();
             draw();
             if (rx_off_dialog_field_ >= 0)
@@ -1340,6 +1353,22 @@ private:
     bool handle_resize(int ch) {
         if (ch != KEY_RESIZE) return false;
         resize_term(0, 0);
+        state_.add_log("UI: resize event -> " + std::to_string(COLS) + "x" +
+                       std::to_string(LINES));
+        return true;
+    }
+
+    // KEY_RESIZE only arrives when the console *buffer* size changes.  The
+    // wincon backend runs in its own buffer whose height can exceed the
+    // window (scrollback), so e.g. vertical drags in conhost move just the
+    // viewport and no event is ever queued.  Compare the viewport against
+    // the curses size directly to catch those.
+    bool poll_resize() {
+        int r = PDC_get_rows(), c = PDC_get_columns();
+        if ((r == LINES && c == COLS) || r < 2 || c < 2) return false;
+        resize_term(0, 0);
+        state_.add_log("UI: viewport poll -> " + std::to_string(COLS) + "x" +
+                       std::to_string(LINES));
         return true;
     }
 
@@ -1772,7 +1801,7 @@ private:
     // buf must hold at least max_len + 1 bytes.
     bool prompt_input(int y, int x, char* buf, int max_len) {
         curs_set(1);
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
 
         int len = (int)strlen(buf);
         bool accepted = false;
@@ -1785,6 +1814,9 @@ private:
 
             int ch = getch();
             if (handle_resize(ch)) {
+                continue;
+            } else if (ch == ERR) {
+                poll_resize();
                 continue;
             } else if (ch == 27) {
                 break;
@@ -2286,7 +2318,7 @@ private:
             scroll_offset = selection - max_visible + 1;
         }
         
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
         
         while (true) {
             // Clear dialog area
@@ -2356,7 +2388,7 @@ private:
             
             int ch = getch();
 
-            if (handle_resize(ch)) {
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
                 getmaxyx(stdscr, rows, cols);
                 dialog_w = std::min(cols - 4, 58);
                 dialog_x = (cols - dialog_w) / 2;
@@ -2458,7 +2490,7 @@ private:
         }
 
 
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
 
         while (true) {
             for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
@@ -2521,7 +2553,7 @@ private:
 
             int ch = getch();
 
-            if (handle_resize(ch)) {
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
                 getmaxyx(stdscr, rows, cols);
                 dialog_w = std::min(cols - 4, 58);
                 dialog_x = (cols - dialog_w) / 2;
