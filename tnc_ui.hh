@@ -3,6 +3,13 @@
 #include <locale.h>
 #define PDC_NCMOUSE
 #include <curses.h>
+
+// PDCurses wincon internals (deps/pdcurses/wincon/pdcgetsc.c): the live
+// console viewport size.  Needed to detect window resizes that never queue
+// a WINDOW_BUFFER_SIZE_EVENT (conhost only sends one when the screen
+// *buffer* changes, and its buffer can be scrollback-sized).
+extern "C" int PDC_get_rows(void);
+extern "C" int PDC_get_columns(void);
 #include <string>
 #include <vector>
 #include <deque>
@@ -29,6 +36,7 @@
 #include "phy/mfsk_modem.hh"
 #include "phy/robust_modem.hh"
 #include "perf_log.hh"
+#include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
 #endif
@@ -172,6 +180,10 @@ struct TNCUIState {
     int frame_size = 1;        // 0=short, 1=normal, 2=long
     int center_freq = 1500;
     bool postamble = false;
+
+    bool ofdm_rx_enabled = true;
+    bool robust_rx_enabled = true;
+    bool mfsk_rx_enabled = true;
 
     bool csma_enabled = true;
     float carrier_threshold_db = -30.0f;
@@ -701,6 +713,9 @@ struct TNCUIState {
         fprintf(f, "csma_band=%d\n", csma_band);
         fprintf(f, "fragmentation_enabled=%d\n", fragmentation_enabled ? 1 : 0);
         fprintf(f, "tx_blanking_enabled=%d\n", tx_blanking_enabled ? 1 : 0);
+        fprintf(f, "ofdm_rx_enabled=%d\n", ofdm_rx_enabled ? 1 : 0);
+        fprintf(f, "robust_rx_enabled=%d\n", robust_rx_enabled ? 1 : 0);
+        fprintf(f, "mfsk_rx_enabled=%d\n", mfsk_rx_enabled ? 1 : 0);
         fprintf(f, "# Audio/PTT\n");
         fprintf(f, "audio_input=%s\n", audio_input_device.c_str());
         fprintf(f, "audio_output=%s\n", audio_output_device.c_str());
@@ -789,6 +804,9 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_band") == 0) csma_band = atoi(value) != 0 ? 1 : 0;
                 else if (strcmp(key, "fragmentation_enabled") == 0) fragmentation_enabled = atoi(value) != 0;
                 else if (strcmp(key, "tx_blanking_enabled") == 0) tx_blanking_enabled = atoi(value) != 0;
+                else if (strcmp(key, "ofdm_rx_enabled") == 0) ofdm_rx_enabled = atoi(value) != 0;
+                else if (strcmp(key, "robust_rx_enabled") == 0) robust_rx_enabled = atoi(value) != 0;
+                else if (strcmp(key, "mfsk_rx_enabled") == 0) mfsk_rx_enabled = atoi(value) != 0;
                 else if (strcmp(key, "audio_input") == 0) audio_input_device = value;
                 else if (strcmp(key, "audio_output") == 0) audio_output_device = value;
                 else if (strcmp(key, "audio_device") == 0) {
@@ -1229,14 +1247,24 @@ public:
         }
         
         running_ = true;
-        
+
+        // marker so a running build can be identified as resize-aware
+        state_.add_log("UI: console resize watch v2 (" +
+                       std::to_string(COLS) + "x" + std::to_string(LINES) + ")");
+
         while (running_ && g_running) {
             int ch = getch();
-            if (ch != ERR) {
+            if (handle_resize(ch)) {
+                clear();
+            } else if (ch != ERR) {
                 handle_input(ch);
             }
+            if (poll_resize())
+                clear();
             tick_auto_send();
             draw();
+            if (rx_off_dialog_field_ >= 0)
+                draw_rx_off_dialog();
             refresh();
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
@@ -1277,6 +1305,9 @@ private:
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
+        FIELD_RX_OFDM,
+        FIELD_RX_ROBUST,
+        FIELD_RX_MFSK,
         FIELD_AUDIO_INPUT,
         FIELD_AUDIO_OUTPUT,
         FIELD_PTT_TYPE,
@@ -1317,7 +1348,66 @@ private:
         return false;
     }
 
+    bool console_size(int& rows, int& cols) {
+        int r = PDC_get_rows(), c = PDC_get_columns();
+        if (r != LINES || c != COLS) {
+            pdc_viewport_live_ = true;
+        } else if (!pdc_viewport_live_) {
+            CONSOLE_SCREEN_BUFFER_INFO sbi;
+            HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (out != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(out, &sbi)) {
+                r = sbi.srWindow.Bottom - sbi.srWindow.Top + 1;
+                c = sbi.srWindow.Right - sbi.srWindow.Left + 1;
+            }
+        }
+        if (r < 2 || c < 2) return false;
+        rows = r;
+        cols = c;
+        return true;
+    }
+
+    bool adopt_console_size(const char* how) {
+        int r, c;
+        if (!console_size(r, c) || (r == LINES && c == COLS)) return false;
+        resize_term(r, c);
+        state_.add_log(std::string("UI: ") + how + " " + std::to_string(r) + "x" +
+                       std::to_string(c) + " -> " + std::to_string(COLS) + "x" +
+                       std::to_string(LINES));
+        return true;
+    }
+
+    bool handle_resize(int ch) {
+        if (ch != KEY_RESIZE) return false;
+        if (!adopt_console_size("resize event"))
+            resize_term(0, 0);
+        return true;
+    }
+
+    bool poll_resize() {
+        return adopt_console_size("viewport poll");
+    }
+
+    bool pdc_viewport_live_ = false;
+
     void handle_input(int ch) {
+        if (rx_off_dialog_field_ >= 0) {
+            if (ch == 'y' || ch == 'Y' || ch == '\n' || ch == KEY_ENTER) {
+                bool* flag = rx_dialog_flag();
+                if (flag) {
+                    *flag = false;
+                    apply_settings();
+                    state_.add_log(std::string("(!) ") + rx_dialog_name() +
+                                   " RX decoding disabled");
+                    if (rx_field_modem(rx_off_dialog_field_) == state_.modem_type_index)
+                        state_.add_log(std::string("(!) ") + rx_dialog_name() +
+                                       " decoder stays on while it is the TX mode");
+                }
+                rx_off_dialog_field_ = -1;
+            } else if (ch == 'n' || ch == 'N' || ch == 27 || ch == 'q') {
+                rx_off_dialog_field_ = -1;
+            }
+            return;
+        }
         if (ch == KEY_MOUSE) {
             MEVENT event;
             if (getmouse(&event) == OK) {
@@ -1498,7 +1588,7 @@ private:
                     } else if (current_field_ == FIELD_COM_PORT) {
 
 
-                        edit_text_field(FIELD_COM_PORT);
+                        show_com_port_dialog();
 
 #ifdef WITH_CM108
                     } else if (current_field_ == FIELD_CM108_GPIO) {
@@ -1728,7 +1818,7 @@ private:
     // buf must hold at least max_len + 1 bytes.
     bool prompt_input(int y, int x, char* buf, int max_len) {
         curs_set(1);
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
 
         int len = (int)strlen(buf);
         bool accepted = false;
@@ -1740,7 +1830,12 @@ private:
             refresh();
 
             int ch = getch();
-            if (ch == 27) {
+            if (handle_resize(ch)) {
+                continue;
+            } else if (ch == ERR) {
+                poll_resize();
+                continue;
+            } else if (ch == 27) {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
                 accepted = true;
@@ -1959,6 +2054,13 @@ private:
         if (field == FIELD_TX_BLANKING) return row;
         row += 2;
         row++;
+        if (field == FIELD_RX_OFDM) return row;
+        row++;
+        if (field == FIELD_RX_ROBUST) return row;
+        row++;
+        if (field == FIELD_RX_MFSK) return row;
+        row += 2;
+        row++;
         if (field == FIELD_AUDIO_INPUT) return row;
         row++;
         if (field == FIELD_AUDIO_OUTPUT) return row;
@@ -2116,6 +2218,15 @@ private:
                 apply_settings();
                 state_.add_log(std::string("TX blanking ") + (state_.tx_blanking_enabled ? "enabled" : "disabled"));
                 break;
+            case FIELD_RX_OFDM:
+                toggle_rx_decoder(state_.ofdm_rx_enabled, "OFDM");
+                break;
+            case FIELD_RX_ROBUST:
+                toggle_rx_decoder(state_.robust_rx_enabled, "ROBUST");
+                break;
+            case FIELD_RX_MFSK:
+                toggle_rx_decoder(state_.mfsk_rx_enabled, "MFSK");
+                break;
             case FIELD_AUDIO_INPUT:
                 break;
             case FIELD_AUDIO_OUTPUT:
@@ -2224,7 +2335,7 @@ private:
             scroll_offset = selection - max_visible + 1;
         }
         
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
         
         while (true) {
             // Clear dialog area
@@ -2293,7 +2404,17 @@ private:
             refresh();
             
             int ch = getch();
-            
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
+
             if (ch == 27 || ch == 'q') {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
@@ -2329,6 +2450,171 @@ private:
         }
         
         nodelay(stdscr, TRUE);
+    }
+
+    void show_com_port_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        auto ports = SerialPTT::enumerate();
+
+        std::vector<std::string> values;
+        std::vector<std::string> descriptions;
+
+        for (const auto& p : ports) {
+            values.push_back(p.port);
+            if (p.description.empty())
+                descriptions.push_back(p.port);
+            else if (p.description.find(p.port) != std::string::npos)
+                descriptions.push_back(p.description);
+            else
+                descriptions.push_back(p.port + " - " + p.description);
+        }
+
+        int selection = -1;
+        for (int i = 0; i < (int)values.size(); i++) {
+            if (values[i] == state_.com_port) { selection = i; break; }
+        }
+        if (selection < 0 && !state_.com_port.empty()) {
+            values.push_back(state_.com_port);
+            descriptions.push_back(state_.com_port + " (not connected)");
+            selection = (int)values.size() - 1;
+        }
+
+        int manual_idx = (int)values.size();
+        values.push_back("");
+        descriptions.push_back("Manual entry...");
+        if (selection < 0) selection = 0;
+
+        int dialog_w = std::min(cols - 4, 58);
+        int max_visible = std::min((int)values.size(), 12);
+        int dialog_h = max_visible + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        int scroll_offset = 0;
+        if (selection >= max_visible) {
+            scroll_offset = selection - max_visible + 1;
+        }
+
+        bool manual = false;
+
+        timeout(250);
+
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            const char* title = " COM Port ";
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            int visible_count = std::min((int)values.size() - scroll_offset, max_visible);
+            for (int i = 0; i < visible_count; i++) {
+                int dev_idx = scroll_offset + i;
+                int y = dialog_y + 1 + i;
+
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+
+                if (dev_idx == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+
+                std::string desc = descriptions[dev_idx];
+                int max_len = dialog_w - 4;
+                if ((int)desc.length() > max_len) {
+                    desc = desc.substr(0, max_len - 2) + "..";
+                }
+                addstr(desc.c_str());
+
+                if (dev_idx == selection) {
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+
+            if (scroll_offset > 0) {
+                attron(A_DIM);
+                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
+                attroff(A_DIM);
+            }
+            if (scroll_offset + max_visible < (int)values.size()) {
+                attron(A_DIM);
+                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
+                attroff(A_DIM);
+            }
+
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 15, "(needs restart)");
+            attroff(A_DIM);
+
+            refresh();
+
+            int ch = getch();
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection == manual_idx) {
+                    manual = true;
+                } else if (selection >= 0 && selection < (int)values.size()) {
+                    if (values[selection] != state_.com_port) {
+                        state_.com_port = values[selection];
+                        state_.add_log("(!) COM port changed, restart required");
+                        apply_settings();
+                    }
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) {
+                    selection--;
+                    if (selection < scroll_offset) scroll_offset = selection;
+                }
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < (int)values.size() - 1) {
+                    selection++;
+                    if (selection >= scroll_offset + max_visible) {
+                        scroll_offset = selection - max_visible + 1;
+                    }
+                }
+            } else if (ch == KEY_PPAGE) {
+                selection = std::max(0, selection - max_visible);
+                scroll_offset = std::max(0, scroll_offset - max_visible);
+            } else if (ch == KEY_NPAGE) {
+                selection = std::min((int)values.size() - 1, selection + max_visible);
+                if (selection >= scroll_offset + max_visible) {
+                    scroll_offset = selection - max_visible + 1;
+                }
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+
+        if (manual) {
+            clear();
+            draw();
+            edit_text_field(FIELD_COM_PORT);
+        }
     }
 
 #ifdef WITH_CM108
@@ -2386,7 +2672,7 @@ private:
         }
 
 
-        nodelay(stdscr, FALSE);
+        timeout(250);  // finite wait so poll_resize() runs while idle
 
         while (true) {
             for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
@@ -2448,6 +2734,16 @@ private:
             refresh();
 
             int ch = getch();
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
 
             if (ch == 27 || ch == 'q') {
                 break;
@@ -3675,7 +3971,39 @@ private:
         dy = visible_y(row);
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_TX_BLANKING, state_.tx_blanking_enabled);
         row += 2;
-        
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            attron(A_DIM);
+            mvaddstr(dy, c1, "RX DECODERS");
+            attroff(A_DIM);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "OFDM", FIELD_RX_OFDM, state_.ofdm_rx_enabled);
+            if (!state_.ofdm_rx_enabled && state_.modem_type_index == 0)
+                draw_rx_forced(dy, c2);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "ROBUST", FIELD_RX_ROBUST, state_.robust_rx_enabled);
+            if (!state_.robust_rx_enabled && state_.modem_type_index == 2)
+                draw_rx_forced(dy, c2);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "MFSK", FIELD_RX_MFSK, state_.mfsk_rx_enabled);
+            if (!state_.mfsk_rx_enabled && state_.modem_type_index == 1)
+                draw_rx_forced(dy, c2);
+        }
+        row += 2;
+
         // Audio / ptt
 
         dy = visible_y(row);
@@ -5679,6 +6007,79 @@ private:
     std::atomic<bool> running_{false};
     int current_tab_ = 0;
     int current_field_ = 0;
+    int rx_off_dialog_field_ = -1;
+
+    bool* rx_dialog_flag() {
+        switch (rx_off_dialog_field_) {
+            case FIELD_RX_OFDM: return &state_.ofdm_rx_enabled;
+            case FIELD_RX_ROBUST: return &state_.robust_rx_enabled;
+            case FIELD_RX_MFSK: return &state_.mfsk_rx_enabled;
+        }
+        return nullptr;
+    }
+
+    const char* rx_dialog_name() {
+        switch (rx_off_dialog_field_) {
+            case FIELD_RX_OFDM: return "OFDM";
+            case FIELD_RX_ROBUST: return "ROBUST";
+            case FIELD_RX_MFSK: return "MFSK";
+        }
+        return "";
+    }
+
+    void draw_rx_forced(int dy, int c2) {
+        attron(COLOR_PAIR(4));
+        mvaddstr(dy, c2 + 10, "still on: current TX mode");
+        attroff(COLOR_PAIR(4));
+    }
+
+    int rx_field_modem(int field) {
+        switch (field) {
+            case FIELD_RX_OFDM: return 0;
+            case FIELD_RX_MFSK: return 1;
+            case FIELD_RX_ROBUST: return 2;
+        }
+        return -1;
+    }
+
+    void draw_rx_off_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        bool active = rx_field_modem(rx_off_dialog_field_) == state_.modem_type_index;
+        int w = 56, h = active ? 11 : 8;
+        int y = (rows - h) / 2, x = (cols - w) / 2;
+        if (y < 0 || x < 0) return;
+        for (int i = 0; i < h; i++) {
+            move(y + i, x);
+            for (int j = 0; j < w; j++) addch(' ');
+        }
+        draw_box(y, x, h, w);
+        std::string name = rx_dialog_name();
+        attron(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 1, x + 2, ("(!) DISABLE " + name + " RX DECODING?").c_str());
+        attroff(COLOR_PAIR(3) | A_BOLD);
+        mvaddstr(y + 3, x + 2, "This saves CPU performance, but disables ALL");
+        mvaddstr(y + 4, x + 2, ("reception of " + name + " frames until re-enabled.").c_str());
+        if (active) {
+            attron(COLOR_PAIR(4));
+            mvaddstr(y + 6, x + 2, ("NOTE: " + name + " is the current TX modem type, so").c_str());
+            mvaddstr(y + 7, x + 2, "its decoder keeps running until you switch modes.");
+            attroff(COLOR_PAIR(4));
+        }
+        attron(A_BOLD);
+        mvaddstr(y + h - 2, x + 2, "[Y] Disable        [N] Cancel");
+        attroff(A_BOLD);
+    }
+
+    void toggle_rx_decoder(bool& flag, const char* name) {
+        if (!flag) {
+            flag = true;
+            apply_settings();
+            state_.add_log(std::string(name) + " RX decoding enabled");
+        } else {
+            rx_off_dialog_field_ = current_field_;
+        }
+    }
     int config_scroll_ = 0;
     int log_scroll_ = 0;
     int utils_selection_ = 0;
