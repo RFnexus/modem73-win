@@ -266,30 +266,7 @@ public:
         std::cerr << "Audio output: " << config_.audio_output_device << std::endl;
         
         // Initialize PTT based on ptt_type
-        if (config_.ptt_type == PTTType::RIGCTL) {
-            rigctl_ = std::make_unique<RigctlPTT>(config_.rigctl_host, config_.rigctl_port);
-            if (!rigctl_->connect()) {
-                std::cerr << "Could not connect to rigctl" << std::endl;
-            }
-        } else if (config_.ptt_type == PTTType::COM) {
-            serial_ptt_ = std::make_unique<SerialPTT>();
-            if (!serial_ptt_->open(config_.com_port, 
-                                   static_cast<PTTLine>(config_.com_ptt_line),
-                                   config_.com_invert_dtr, 
-                                   config_.com_invert_rts)) {
-                std::cerr << "Could not open COM port: " << serial_ptt_->last_error() << std::endl;
-                ui_log(std::string("(!) COM PTT: ") + serial_ptt_->last_error());
-                ui_log("(!) PTT will not key the radio - check COM port in settings");
-            }
-#ifdef WITH_CM108
-        } else if (config_.ptt_type == PTTType::CM108) {
-            cm108_ptt_ = std::make_unique<CM108PTT>();
-            cm108_ptt_->open(config_.cm108_gpio, config_.cm108_device);
-#endif
-        } else {
-            dummy_ptt_ = std::make_unique<DummyPTT>();
-            dummy_ptt_->connect();
-        }
+        init_ptt_driver();
         
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ == INVALID_SOCKET) {
@@ -1411,6 +1388,54 @@ private:
         }
     }
     
+    void init_ptt_driver() {
+        rigctl_.reset();
+        serial_ptt_.reset();
+#ifdef WITH_CM108
+        cm108_ptt_.reset();
+#endif
+        dummy_ptt_.reset();
+        ptt_fail_logged_ = false;
+
+        if (config_.ptt_type == PTTType::RIGCTL) {
+            rigctl_ = std::make_unique<RigctlPTT>(config_.rigctl_host, config_.rigctl_port);
+            if (!rigctl_->connect()) {
+                std::cerr << "Could not connect to rigctl" << std::endl;
+                ui_log("(!) rigctl PTT: could not connect to " + config_.rigctl_host +
+                       ":" + std::to_string(config_.rigctl_port));
+            } else {
+                ui_log("PTT: rigctl " + config_.rigctl_host + ":" +
+                       std::to_string(config_.rigctl_port));
+            }
+        } else if (config_.ptt_type == PTTType::COM) {
+            serial_ptt_ = std::make_unique<SerialPTT>();
+            if (!serial_ptt_->open(config_.com_port,
+                                   static_cast<PTTLine>(config_.com_ptt_line),
+                                   config_.com_invert_dtr,
+                                   config_.com_invert_rts)) {
+                std::cerr << "Could not open COM port: " << serial_ptt_->last_error() << std::endl;
+                ui_log(std::string("(!) COM PTT: ") + serial_ptt_->last_error());
+                ui_log("(!) PTT will not key the radio - check COM port in settings");
+            } else {
+                ui_log("PTT: " + serial_ptt_->port() + " (" +
+                       PTT_LINE_OPTIONS[config_.com_ptt_line] + ") ready");
+            }
+#ifdef WITH_CM108
+        } else if (config_.ptt_type == PTTType::CM108) {
+            cm108_ptt_ = std::make_unique<CM108PTT>();
+            if (!cm108_ptt_->open(config_.cm108_gpio, config_.cm108_device))
+                ui_log("(!) CM108 PTT: device not found - check connection and settings");
+            else
+                ui_log("PTT: CM108 GPIO" + std::to_string(config_.cm108_gpio) + " ready");
+#endif
+        } else {
+            dummy_ptt_ = std::make_unique<DummyPTT>();
+            dummy_ptt_->connect();
+            if (config_.ptt_type == PTTType::VOX)
+                ui_log("PTT: VOX " + std::to_string(config_.vox_tone_freq) + "Hz tone");
+        }
+    }
+
     bool set_ptt(bool on) {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         bool ok = true;
@@ -1429,7 +1454,10 @@ private:
             ptt_state_.store(true);
             if (!ok && !ptt_fail_logged_) {
                 ptt_fail_logged_ = true;
-                ui_log("(!) PTT key failed - radio is NOT transmitting, check PTT settings");
+                std::string msg = "(!) PTT key failed - radio is NOT transmitting, check PTT settings";
+                if (serial_ptt_ && !serial_ptt_->last_error().empty())
+                    msg += " [" + serial_ptt_->last_error() + "]";
+                ui_log(msg);
             }
         } else if (ok) {
             ptt_state_.store(false);
@@ -1563,7 +1591,7 @@ private:
     bool dcd_active_ = false;
     std::atomic<bool> alc_tune_active_{false};
 
-    std::mutex ptt_mutex_;
+    mutable std::mutex ptt_mutex_;
     std::atomic<bool> ptt_state_{false};
     bool ptt_fail_logged_ = false;
     int ptt_unkey_retries_ = 0;
@@ -1755,6 +1783,52 @@ public:
                        " " + ModemConfig::frame_size_name(config_.frame_size) + ", keeping previous");
             }
         }
+
+        config_.vox_tone_freq = new_config.vox_tone_freq;
+        config_.vox_lead_ms = new_config.vox_lead_ms;
+        config_.vox_tail_ms = new_config.vox_tail_ms;
+
+        bool ptt_changed =
+            config_.ptt_type != new_config.ptt_type ||
+            config_.com_port != new_config.com_port ||
+            config_.com_ptt_line != new_config.com_ptt_line ||
+            config_.com_invert_dtr != new_config.com_invert_dtr ||
+            config_.com_invert_rts != new_config.com_invert_rts ||
+            config_.rigctl_host != new_config.rigctl_host ||
+            config_.rigctl_port != new_config.rigctl_port;
+#ifdef WITH_CM108
+        ptt_changed = ptt_changed ||
+            config_.cm108_gpio != new_config.cm108_gpio ||
+            config_.cm108_device != new_config.cm108_device;
+#endif
+        if (ptt_changed) {
+            std::lock_guard<std::mutex> plock(ptt_mutex_);
+            if (ptt_state_.load()) {
+                if (rigctl_) rigctl_->set_ptt(false);
+                else if (serial_ptt_) serial_ptt_->ptt_off();
+#ifdef WITH_CM108
+                else if (cm108_ptt_) cm108_ptt_->set_ptt(false);
+#endif
+                ptt_state_.store(false);
+                ptt_deadline_ms_.store(0);
+                ptt_unkey_retries_ = 0;
+#ifdef WITH_UI
+                if (g_ui_state) g_ui_state->ptt_on = false;
+#endif
+            }
+            config_.ptt_type = new_config.ptt_type;
+            config_.com_port = new_config.com_port;
+            config_.com_ptt_line = new_config.com_ptt_line;
+            config_.com_invert_dtr = new_config.com_invert_dtr;
+            config_.com_invert_rts = new_config.com_invert_rts;
+            config_.rigctl_host = new_config.rigctl_host;
+            config_.rigctl_port = new_config.rigctl_port;
+#ifdef WITH_CM108
+            config_.cm108_gpio = new_config.cm108_gpio;
+            config_.cm108_device = new_config.cm108_device;
+#endif
+            init_ptt_driver();
+        }
     }
     
     TNCConfig get_config() {
@@ -1823,11 +1897,13 @@ public:
     }
 
     std::string rigctl_command(const std::string& cmd) {
+        std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->send_command(cmd);
         return "ERR: rigctl not enabled";
     }
 
     bool is_rigctl_connected() const {
+        std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->is_connected();
         return false;
     }
@@ -2925,6 +3001,8 @@ int main(int argc, char** argv) {
                 new_config.audio_output_device = state.audio_output_device;
                 // PTT settings
                 new_config.ptt_type = static_cast<PTTType>(state.ptt_type_index);
+                new_config.rigctl_host = state.rigctl_host;
+                new_config.rigctl_port = state.rigctl_port;
                 new_config.vox_tone_freq = state.vox_tone_freq;
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
@@ -2933,6 +3011,10 @@ int main(int argc, char** argv) {
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;
+#ifdef WITH_CM108
+                new_config.cm108_gpio = state.cm108_gpio;
+                new_config.cm108_device = state.cm108_device;
+#endif
 
                 tnc.update_config(new_config);
                 if (ctrl) ctrl->notify_config_changed();

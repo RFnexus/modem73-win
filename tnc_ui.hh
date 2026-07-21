@@ -36,6 +36,7 @@ extern "C" int PDC_get_columns(void);
 #include "phy/mfsk_modem.hh"
 #include "phy/robust_modem.hh"
 #include "perf_log.hh"
+#include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
 #endif
@@ -1248,7 +1249,7 @@ public:
         running_ = true;
 
         // marker so a running build can be identified as resize-aware
-        state_.add_log("UI: console resize watch active (" +
+        state_.add_log("UI: console resize watch v2 (" +
                        std::to_string(COLS) + "x" + std::to_string(LINES) + ")");
 
         while (running_ && g_running) {
@@ -1347,30 +1348,46 @@ private:
         return false;
     }
 
-    // PDCurses (unlike ncurses on SIGWINCH) does not adopt a new console
-    // size by itself: after getch() returns KEY_RESIZE the app must call
-    // resize_term(0, 0) to grow/shrink the curses screen to the window
-    bool handle_resize(int ch) {
-        if (ch != KEY_RESIZE) return false;
-        resize_term(0, 0);
-        state_.add_log("UI: resize event -> " + std::to_string(COLS) + "x" +
+    bool console_size(int& rows, int& cols) {
+        int r = PDC_get_rows(), c = PDC_get_columns();
+        if (r != LINES || c != COLS) {
+            pdc_viewport_live_ = true;
+        } else if (!pdc_viewport_live_) {
+            CONSOLE_SCREEN_BUFFER_INFO sbi;
+            HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+            if (out != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(out, &sbi)) {
+                r = sbi.srWindow.Bottom - sbi.srWindow.Top + 1;
+                c = sbi.srWindow.Right - sbi.srWindow.Left + 1;
+            }
+        }
+        if (r < 2 || c < 2) return false;
+        rows = r;
+        cols = c;
+        return true;
+    }
+
+    bool adopt_console_size(const char* how) {
+        int r, c;
+        if (!console_size(r, c) || (r == LINES && c == COLS)) return false;
+        resize_term(r, c);
+        state_.add_log(std::string("UI: ") + how + " " + std::to_string(r) + "x" +
+                       std::to_string(c) + " -> " + std::to_string(COLS) + "x" +
                        std::to_string(LINES));
         return true;
     }
 
-    // KEY_RESIZE only arrives when the console *buffer* size changes.  The
-    // wincon backend runs in its own buffer whose height can exceed the
-    // window (scrollback), so e.g. vertical drags in conhost move just the
-    // viewport and no event is ever queued.  Compare the viewport against
-    // the curses size directly to catch those.
-    bool poll_resize() {
-        int r = PDC_get_rows(), c = PDC_get_columns();
-        if ((r == LINES && c == COLS) || r < 2 || c < 2) return false;
-        resize_term(0, 0);
-        state_.add_log("UI: viewport poll -> " + std::to_string(COLS) + "x" +
-                       std::to_string(LINES));
+    bool handle_resize(int ch) {
+        if (ch != KEY_RESIZE) return false;
+        if (!adopt_console_size("resize event"))
+            resize_term(0, 0);
         return true;
     }
+
+    bool poll_resize() {
+        return adopt_console_size("viewport poll");
+    }
+
+    bool pdc_viewport_live_ = false;
 
     void handle_input(int ch) {
         if (rx_off_dialog_field_ >= 0) {
@@ -1571,7 +1588,7 @@ private:
                     } else if (current_field_ == FIELD_COM_PORT) {
 
 
-                        edit_text_field(FIELD_COM_PORT);
+                        show_com_port_dialog();
 
 #ifdef WITH_CM108
                     } else if (current_field_ == FIELD_CM108_GPIO) {
@@ -2433,6 +2450,171 @@ private:
         }
         
         nodelay(stdscr, TRUE);
+    }
+
+    void show_com_port_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        auto ports = SerialPTT::enumerate();
+
+        std::vector<std::string> values;
+        std::vector<std::string> descriptions;
+
+        for (const auto& p : ports) {
+            values.push_back(p.port);
+            if (p.description.empty())
+                descriptions.push_back(p.port);
+            else if (p.description.find(p.port) != std::string::npos)
+                descriptions.push_back(p.description);
+            else
+                descriptions.push_back(p.port + " - " + p.description);
+        }
+
+        int selection = -1;
+        for (int i = 0; i < (int)values.size(); i++) {
+            if (values[i] == state_.com_port) { selection = i; break; }
+        }
+        if (selection < 0 && !state_.com_port.empty()) {
+            values.push_back(state_.com_port);
+            descriptions.push_back(state_.com_port + " (not connected)");
+            selection = (int)values.size() - 1;
+        }
+
+        int manual_idx = (int)values.size();
+        values.push_back("");
+        descriptions.push_back("Manual entry...");
+        if (selection < 0) selection = 0;
+
+        int dialog_w = std::min(cols - 4, 58);
+        int max_visible = std::min((int)values.size(), 12);
+        int dialog_h = max_visible + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        int scroll_offset = 0;
+        if (selection >= max_visible) {
+            scroll_offset = selection - max_visible + 1;
+        }
+
+        bool manual = false;
+
+        timeout(250);
+
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            const char* title = " COM Port ";
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            int visible_count = std::min((int)values.size() - scroll_offset, max_visible);
+            for (int i = 0; i < visible_count; i++) {
+                int dev_idx = scroll_offset + i;
+                int y = dialog_y + 1 + i;
+
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+
+                if (dev_idx == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+
+                std::string desc = descriptions[dev_idx];
+                int max_len = dialog_w - 4;
+                if ((int)desc.length() > max_len) {
+                    desc = desc.substr(0, max_len - 2) + "..";
+                }
+                addstr(desc.c_str());
+
+                if (dev_idx == selection) {
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+
+            if (scroll_offset > 0) {
+                attron(A_DIM);
+                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
+                attroff(A_DIM);
+            }
+            if (scroll_offset + max_visible < (int)values.size()) {
+                attron(A_DIM);
+                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
+                attroff(A_DIM);
+            }
+
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 15, "(needs restart)");
+            attroff(A_DIM);
+
+            refresh();
+
+            int ch = getch();
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection == manual_idx) {
+                    manual = true;
+                } else if (selection >= 0 && selection < (int)values.size()) {
+                    if (values[selection] != state_.com_port) {
+                        state_.com_port = values[selection];
+                        state_.add_log("(!) COM port changed, restart required");
+                        apply_settings();
+                    }
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) {
+                    selection--;
+                    if (selection < scroll_offset) scroll_offset = selection;
+                }
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < (int)values.size() - 1) {
+                    selection++;
+                    if (selection >= scroll_offset + max_visible) {
+                        scroll_offset = selection - max_visible + 1;
+                    }
+                }
+            } else if (ch == KEY_PPAGE) {
+                selection = std::max(0, selection - max_visible);
+                scroll_offset = std::max(0, scroll_offset - max_visible);
+            } else if (ch == KEY_NPAGE) {
+                selection = std::min((int)values.size() - 1, selection + max_visible);
+                if (selection >= scroll_offset + max_visible) {
+                    scroll_offset = selection - max_visible + 1;
+                }
+            }
+        }
+
+        nodelay(stdscr, TRUE);
+
+        if (manual) {
+            clear();
+            draw();
+            edit_text_field(FIELD_COM_PORT);
+        }
     }
 
 #ifdef WITH_CM108
