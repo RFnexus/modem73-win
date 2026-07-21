@@ -80,6 +80,7 @@ public:
     }
 
     bool ptt_off() {
+        if (handle_ == INVALID_HANDLE_VALUE) return true;
         return apply(false);
     }
 

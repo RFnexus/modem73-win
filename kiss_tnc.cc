@@ -278,6 +278,8 @@ public:
                                    config_.com_invert_dtr, 
                                    config_.com_invert_rts)) {
                 std::cerr << "Could not open COM port: " << serial_ptt_->last_error() << std::endl;
+                ui_log(std::string("(!) COM PTT: ") + serial_ptt_->last_error());
+                ui_log("(!) PTT will not key the radio - check COM port in settings");
             }
 #ifdef WITH_CM108
         } else if (config_.ptt_type == PTTType::CM108) {
@@ -1411,12 +1413,22 @@ private:
         }
         if (on) {
             ptt_state_.store(true);
+            if (!ok && !ptt_fail_logged_) {
+                ptt_fail_logged_ = true;
+                ui_log("(!) PTT key failed - radio is NOT transmitting, check PTT settings");
+            }
         } else if (ok) {
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
-        } else {
+            ptt_unkey_retries_ = 0;
+        } else if (++ptt_unkey_retries_ < 5) {
             ptt_state_.store(true);
             ptt_deadline_ms_.store(steady_now_ms() + 1000);
+        } else {
+            ptt_state_.store(false);
+            ptt_deadline_ms_.store(0);
+            ptt_unkey_retries_ = 0;
+            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX");
         }
 
 #ifdef WITH_UI
@@ -1539,6 +1551,8 @@ private:
 
     std::mutex ptt_mutex_;
     std::atomic<bool> ptt_state_{false};
+    bool ptt_fail_logged_ = false;
+    int ptt_unkey_retries_ = 0;
     std::atomic<int64_t> ptt_deadline_ms_{0};
     static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
 
