@@ -15,8 +15,6 @@ MODEM73 is an open source software modem that works with any HF, VHF, or UHF rad
 
 This fork of the [modem73](https://github.com/RFnexus/modem73) upstream uses LLM assisted tooling for porting modem73 to Win32 exclusive APIs and PDcurses.  As such this repo is  experimental. For Windows users it's recommended to use the upstream modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) for stability, or switch to an operating system that [respects your privacy and autonomy as a human](https://www.youtube.com/watch?v=n8vmXvoVjZw). 
 
-Did you know modem73 can run comfortably on a old laptop flashed with Linux Mint or something like a Raspberry Pi 4 at 30% CPU?
-
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
 <p>
 <img width="546" height="423" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
@@ -127,7 +125,7 @@ A control port for modem73 will automatically start on port `8073` by default. V
 <img width="1092" height="847" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
 
 ### All In One Audio Cable (AIOC)
-modem73 supports the [AIOC](https://github.com/skuep/AIOC) out of the box. To use the All In One Audio cable, set PTT to COM, specify your COM port, and set PTT line to `BOTH` and Invert to `INVERT RTS`. Check Device Manager for the COM number (e.g. COM5). Note that it may change after a device restart, plugging it back in, etc.
+modem73 supports the [AIOC](https://github.com/skuep/AIOC) out of the box. To use the All In One Audio cable, set PTT to COM, specify your COM port, and set PTT line to `BOTH` and invert as `NORMAL`. Check Device Manager for the COM number (e.g. COM5). Note that it may change after a device restart, plugging it back in, etc.
 
 ### rigctl
 modem73 supports Hamlib and rigctl for any rigctl supported radio for PTT. Set rigctl to your options and run `rigctld -m (your model) -s (serial baud rate) -r COMx`  The `d` at the end of `rigctl` tells rigctl to run in network mode, which is what modem73 will connect to.
