@@ -1242,7 +1242,9 @@ public:
         
         while (running_ && g_running) {
             int ch = getch();
-            if (ch != ERR) {
+            if (handle_resize(ch)) {
+                clear();
+            } else if (ch != ERR) {
                 handle_input(ch);
             }
             tick_auto_send();
@@ -1330,6 +1332,15 @@ private:
             if (field == RIG_FIELD_TUNER || field == RIG_FIELD_TUNE) return true;
         }
         return false;
+    }
+
+    // PDCurses (unlike ncurses on SIGWINCH) does not adopt a new console
+    // size by itself: after getch() returns KEY_RESIZE the app must call
+    // resize_term(0, 0) to grow/shrink the curses screen to the window
+    bool handle_resize(int ch) {
+        if (ch != KEY_RESIZE) return false;
+        resize_term(0, 0);
+        return true;
     }
 
     void handle_input(int ch) {
@@ -1773,7 +1784,9 @@ private:
             refresh();
 
             int ch = getch();
-            if (ch == 27) {
+            if (handle_resize(ch)) {
+                continue;
+            } else if (ch == 27) {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
                 accepted = true;
@@ -2342,7 +2355,17 @@ private:
             refresh();
             
             int ch = getch();
-            
+
+            if (handle_resize(ch)) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
+
             if (ch == 27 || ch == 'q') {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
@@ -2497,6 +2520,16 @@ private:
             refresh();
 
             int ch = getch();
+
+            if (handle_resize(ch)) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 58);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
 
             if (ch == 27 || ch == 'q') {
                 break;
