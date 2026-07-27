@@ -16,16 +16,24 @@ MODEM73 is an open source software modem that works with any HF, VHF, or UHF rad
 This fork of the [modem73](https://github.com/RFnexus/modem73) upstream uses LLM assisted tooling for porting modem73 to Win32 exclusive APIs and PDcurses.  As such this repo is  experimental. For Windows users it's recommended to use the upstream modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) for stability, or switch to an operating system that [respects your privacy and autonomy as a human](https://www.youtube.com/watch?v=n8vmXvoVjZw). 
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
-<p>
-<img width="546" height="423" alt="image" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" />
-<img width="276.5" height="199" alt="image" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center"><img height="200" alt="modem73 on a UV-K6 with AIOC" src="https://github.com/user-attachments/assets/7180ab80-4386-4ee1-8029-42ca5300ef13" /></td>
+    <td align="center"><img height="200" alt="modem73 on a Xiegu X6100 with Armbian" src="https://github.com/user-attachments/assets/5ac2a8bd-75a1-48a4-8264-74a851a06767" /></td>
+    <td align="center"><img height="200" alt="modem73 over HF with an IC-7300" src="https://github.com/user-attachments/assets/27fe5f6d-3650-422b-ac52-3ca04b6b1469" /></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Running on a UV-K6 with an All-In-One Audio Cable (AIOC)</sub></td>
+    <td align="center"><sub>Running natively on a Xiegu X6100 with Armbian</sub></td>
+    <td align="center"><sub>Running over HF with an ICOM-7300</sub></td>
+  </tr>
+</table>
 
 
 
 SSB, AM, and FM are all supported. It's plug and play compatible with any KISS application and works with rigctl, CM108 sound devices, and serial PTT out of the box.
 
-There are three modem families each suited for covering any possible RF setup from clean line of sight FM links to poor HF band conditions. The receiver decodes all of them at the same time, so one station can hear anything another station sends without switching modes.
+There are three modem families each suited for covering any possible RF setup from clean line of sight FM links to poor HF band conditions. The receiver decodes all of them at the same time, so one station can hear anything another station sends without switching modes. The modem type can be changed under [ CONFIG ] -> Modem or via the control port  
 
 **OFDM**, based on the open source [COFDMTV modem](https://github.com/aicodix/modem) developed by Ahmet Inan / [aicodix GmbH](https://www.aicodix.de/). Modulations from BPSK to QAM4096 with code rates from 1/4 to 5/6 and payloads from 256 to 6144 bytes per frame. Rates run from about 790 bits per second to over 13 kilobits per second in the same 2400 Hz. 
 
@@ -33,10 +41,17 @@ There are three modem families each suited for covering any possible RF setup fr
 
 **MFSK**, a non-coherent mode for weak signal propagation and backup links. 
 
+
+On VHF/UHF FM, use any OFDM mode.
+
+On good HF SSB paths, use OFDM at 8PSK 1/2  or below depending on your signal budget
+
+On fading/weaker HF paths, use ROBUST modes. For very weak signals or as a backup use MFSK.
+
 ### Features
 
 - KISS over TCP so it works with anything that speaks KISS: APRS clients, HamIRC, packet BBS software, Reticulum, custom applications
-- JSON control port API for status and configuration for writing your own progra,ms
+- JSON control port API for status and configuration for writing your own programs
 - lightweight UI that runs straight from the terminal and headless mode for embedded use 
 
 ## Installation
