@@ -13,7 +13,7 @@ MODEM73 is an open source software modem that works with any HF, VHF, or UHF rad
 
 ### NOTE:
 
-This fork of the [modem73](https://github.com/RFnexus/modem73) upstream uses LLM assisted tooling for porting modem73 to Win32 exclusive APIs and PDcurses.  As such this repo is  experimental. For Windows users it's recommended to use the upstream modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) for stability, or switch to an operating system that [respects your privacy and autonomy as a human](https://www.youtube.com/watch?v=n8vmXvoVjZw). 
+This fork of the [modem73](https://github.com/RFnexus/modem73) upstream uses LLM assisted tooling for porting modem73 to Win32 exclusive APIs and PDcurses.  As such this repo is  experimental. For Windows users it's recommended to use the upstream modem73 with [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) for stability when serial PTT is not needed
 
 ![Screenshot](https://i.ibb.co/4ZhhvcQs/Peek-2026-01-01-10-41.gif)
 <table align="center">
