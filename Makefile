@@ -1,7 +1,8 @@
 # Cross-compile from Linux with mingw-w64 (default), or build natively
-# on Windows under MSYS2 with: make CXX=g++ CC=gcc
+# on Windows under MSYS2 with: make CXX=g++ CC=gcc WINDRES=windres
 CXX = x86_64-w64-mingw32-g++
 CC = x86_64-w64-mingw32-gcc
+WINDRES = x86_64-w64-mingw32-windres
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra
 LDFLAGS = -static -lws2_32 -lsetupapi
 
@@ -22,7 +23,7 @@ PDC_FLAGS = -DPDC_WIDE -DPDC_FORCE_UTF8
 PDC_SRCS = $(wildcard $(PDCURSES)/pdcurses/*.c) $(wildcard $(PDCURSES)/wincon/*.c)
 PDC_OBJS = $(PDC_SRCS:.c=.o)
 
-OBJS = deps/miniaudio.o deps/cJSON.o deps/hidapi/hid.o $(PDC_OBJS)
+OBJS = deps/miniaudio.o deps/cJSON.o deps/hidapi/hid.o $(PDC_OBJS) modem73_res.o
 
 # defualt to build with UI, headless operations through --headless
 UI_FLAGS = -DWITH_UI
@@ -45,6 +46,9 @@ deps/hidapi/hid.o: deps/hidapi/hid.c deps/hidapi/hidapi.h
 
 $(PDCURSES)/%.o: $(PDCURSES)/%.c
 	$(CC) -c -O2 $(PDC_FLAGS) -I$(PDCURSES) -o $@ $<
+
+modem73_res.o: modem73.rc modem73.ico
+	$(WINDRES) modem73.rc $@
 
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(PDC_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
@@ -72,7 +76,7 @@ help:
 	@echo "  MODEM_SRC    - Path to modem source (default: deps/aicodix/modem)"
 	@echo ""
 	@echo "Native build in an MSYS2 MinGW64 shell:"
-	@echo "  make CXX=g++ CC=gcc"
+	@echo "  make CXX=g++ CC=gcc WINDRES=windres"
 	@echo ""
 	@echo "Runtime options:"
 	@echo "  modem73.exe            # Run with UI"

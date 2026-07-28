@@ -930,6 +930,7 @@ private:
                    std::to_string(duration) + " seconds");
             
             if (first) {
+                flush_ptt_reinit();
                 // PTT on (for RIGCTL or COM mode)
                 if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
@@ -1491,6 +1492,17 @@ private:
         ptt_deadline_ms_.store(steady_now_ms() + expected_ms + PTT_WATCHDOG_SLACK_MS);
     }
 
+    void flush_ptt_reinit() {
+        int64_t pending = ptt_reinit_at_ms_.load();
+        if (pending == 0 || ptt_state_.load())
+            return;
+        if (!ptt_reinit_at_ms_.compare_exchange_strong(pending, 0))
+            return;
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        std::lock_guard<std::mutex> plock(ptt_mutex_);
+        init_ptt_driver();
+    }
+
     void ptt_watchdog_loop() {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -1502,6 +1514,9 @@ private:
                 ui_log("PTT watchdog: forcing unkey");
                 set_ptt(false);
             }
+            int64_t reinit_at = ptt_reinit_at_ms_.load();
+            if (reinit_at != 0 && steady_now_ms() >= reinit_at)
+                flush_ptt_reinit();
         }
     }
     
@@ -1603,6 +1618,8 @@ private:
     int ptt_unkey_retries_ = 0;
     std::atomic<int64_t> ptt_deadline_ms_{0};
     static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
+    std::atomic<int64_t> ptt_reinit_at_ms_{0};
+    static constexpr int64_t PTT_REINIT_SETTLE_MS = 1000;
 
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
@@ -1623,6 +1640,7 @@ public:
         }
         float result = -1.0f;
         tx_blanking_active_ = true;
+        flush_ptt_reinit();
         set_ptt(true);
         arm_ptt_watchdog(2000);
         float drive = 0.10f;
@@ -1834,10 +1852,10 @@ public:
             config_.cm108_gpio = new_config.cm108_gpio;
             config_.cm108_device = new_config.cm108_device;
 #endif
-            init_ptt_driver();
+            ptt_reinit_at_ms_.store(steady_now_ms() + PTT_REINIT_SETTLE_MS);
         }
     }
-    
+
     TNCConfig get_config() {
         std::lock_guard<std::mutex> lock(config_mutex_);
         return config_;
