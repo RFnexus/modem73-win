@@ -186,6 +186,7 @@ struct TNCUIState {
     bool mfsk_rx_enabled = true;
 
     bool csma_enabled = true;
+    bool csma_sync_only = false;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -702,6 +703,7 @@ struct TNCUIState {
         fprintf(f, "tx_drive=%.2f\n", tx_drive.load());
         fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
+        fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -793,6 +795,7 @@ struct TNCUIState {
                 else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
                 else if (strcmp(key, "csma_enabled") == 0) csma_enabled = atoi(value) != 0;
+                else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -1294,6 +1297,7 @@ private:
         FIELD_FREQ,
         FIELD_CSMA,
         FIELD_THRESHOLD,
+        FIELD_SYNC_ONLY,
         FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
         FIELD_CSMA_ADV,
@@ -2027,6 +2031,8 @@ private:
         if (field == FIELD_THRESHOLD) return row;
         row++;
         row++;
+        if (field == FIELD_SYNC_ONLY) return row;
+        row++;
         if (field == FIELD_CSMA_BAND) return row;
         row++;
         if (field == FIELD_CSMA_PRESET) return row;
@@ -2171,6 +2177,9 @@ private:
             case FIELD_THRESHOLD:
                 state_.carrier_threshold_db += delta * 2;
                 state_.carrier_threshold_db = std::max(-80.0f, std::min(0.0f, state_.carrier_threshold_db));
+                break;
+            case FIELD_SYNC_ONLY:
+                state_.csma_sync_only = !state_.csma_sync_only;
                 break;
             case FIELD_CSMA_BAND: {
                 int matched = csma_preset_match();
@@ -3224,7 +3233,7 @@ private:
         }
         {
             bool dcd = state_.dcd_active.load();
-            if (busy || dcd) {
+            if (state_.csma_sync_only ? dcd : (busy || dcd)) {
                 attron(COLOR_PAIR(3) | A_BOLD);
                 addstr("  BUSY");
                 attroff(COLOR_PAIR(3) | A_BOLD);
@@ -3862,7 +3871,16 @@ private:
             draw_level_meter(lvl, state_.carrier_threshold_db, 14);
         }
         row++;
-        
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            draw_toggle_field(dy, c1, c2, "Sync Only", FIELD_SYNC_ONLY, state_.csma_sync_only);
+            attron(A_DIM);
+            mvaddstr(dy, c2 + 8, "busy = carrier sync only");
+            attroff(A_DIM);
+        }
+        row++;
+
         dy = visible_y(row);
         if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
                                          CSMA_BAND_NAMES[state_.csma_band & 1]);
@@ -4216,12 +4234,13 @@ private:
 
 
         {
-            bool hf_ok = (state_.modem_type_index == 1) ||
+            bool robust = (state_.modem_type_index == 2);
+            bool hf_ok = robust || (state_.modem_type_index == 1) ||
                          (state_.modulation_index <= 2); // BPSK, QPSK, 8PSK
             mvaddstr(y, c3, "Band  ");
             if (hf_ok) {
                 attron(COLOR_PAIR(3) | A_BOLD);
-                addstr("HF/VHF");
+                addstr(robust ? "HF" : "HF/VHF");
                 attroff(COLOR_PAIR(3) | A_BOLD);
             } else {
                 attron(A_DIM);
