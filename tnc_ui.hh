@@ -1594,6 +1594,11 @@ private:
 
                         show_com_port_dialog();
 
+                    } else if (current_field_ == FIELD_PTT_TYPE) {
+
+
+                        show_ptt_type_dialog();
+
 #ifdef WITH_CM108
                     } else if (current_field_ == FIELD_CM108_GPIO) {
                         edit_text_field(FIELD_CM108_GPIO);
@@ -2241,12 +2246,7 @@ private:
             case FIELD_AUDIO_OUTPUT:
                 break;
             case FIELD_PTT_TYPE:
-#ifdef WITH_CM108
-                state_.ptt_type_index = (state_.ptt_type_index + delta + 5) % 5;
-#else
-                state_.ptt_type_index = (state_.ptt_type_index + delta + 4) % 4;
-#endif
-                break;
+                break;  // Enter opens the PTT type dialog
             case FIELD_VOX_FREQ:
                 state_.vox_tone_freq += delta * 100;
                 state_.vox_tone_freq = std::max(300, std::min(2500, state_.vox_tone_freq));
@@ -2624,6 +2624,106 @@ private:
             draw();
             edit_text_field(FIELD_COM_PORT);
         }
+    }
+
+    void show_ptt_type_dialog() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+
+        static const char* const descriptions[] = {
+            "NONE   - PTT disabled (over the air)",
+            "RIGCTL - Hamlib rigctld (network)",
+            "VOX    - Tone-keyed VOX",
+            "COM    - Serial port DTR/RTS",
+#ifdef WITH_CM108
+            "CM108  - USB HID GPIO",
+#endif
+        };
+        int count = (int)PTT_TYPE_OPTIONS.size();
+
+        int selection = state_.ptt_type_index;
+        if (selection < 0 || selection >= count) selection = 0;
+
+        int dialog_w = std::min(cols - 4, 42);
+        int dialog_h = count + 3;
+        int dialog_x = (cols - dialog_w) / 2;
+        int dialog_y = (rows - dialog_h) / 2;
+
+        timeout(250);  // finite wait so poll_resize() runs while idle
+
+        while (true) {
+            for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
+                move(y, dialog_x);
+                for (int x = 0; x < dialog_w; x++) addch(' ');
+            }
+
+            attron(COLOR_PAIR(4) | A_BOLD);
+            draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            const char* title = " PTT Type ";
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
+            attroff(COLOR_PAIR(4) | A_BOLD);
+
+            for (int i = 0; i < count; i++) {
+                int y = dialog_y + 1 + i;
+                mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
+
+                if (i == selection) {
+                    attron(COLOR_PAIR(4) | A_BOLD);
+                    mvaddstr(y, dialog_x + 1, "> ");
+                } else {
+                    mvaddstr(y, dialog_x + 1, "  ");
+                }
+
+                std::string desc = descriptions[i];
+                int max_len = dialog_w - 4;
+                if ((int)desc.length() > max_len) {
+                    desc = desc.substr(0, max_len - 2) + "..";
+                }
+                addstr(desc.c_str());
+
+                if (i == selection) {
+                    attroff(COLOR_PAIR(4) | A_BOLD);
+                }
+            }
+
+            attron(A_DIM);
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            attroff(A_DIM);
+
+            refresh();
+
+            int ch = getch();
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                getmaxyx(stdscr, rows, cols);
+                dialog_w = std::min(cols - 4, 42);
+                dialog_x = (cols - dialog_w) / 2;
+                dialog_y = (rows - dialog_h) / 2;
+                clear();
+                draw();
+                continue;
+            }
+
+            if (ch == 27 || ch == 'q') {
+                break;
+            } else if (ch == '\n' || ch == KEY_ENTER) {
+                if (selection != state_.ptt_type_index) {
+                    state_.ptt_type_index = selection;
+                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[selection]);
+                    apply_settings();
+                }
+                break;
+            } else if (ch == KEY_UP || ch == 'k') {
+                if (selection > 0) selection--;
+            } else if (ch == KEY_DOWN || ch == 'j') {
+                if (selection < count - 1) selection++;
+            }
+        }
+
+        nodelay(stdscr, TRUE);
     }
 
 #ifdef WITH_CM108
@@ -4056,8 +4156,8 @@ private:
         row++;
         
         dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
-                           PTT_TYPE_OPTIONS[state_.ptt_type_index]);
+        if (dy >= 0) draw_field(dy, c1, c2, "PTT", FIELD_PTT_TYPE,
+                           PTT_TYPE_OPTIONS[state_.ptt_type_index], true);
         row++;
         
         if (state_.ptt_type_index == 2) {  // VOX
