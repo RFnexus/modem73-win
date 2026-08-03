@@ -90,7 +90,7 @@ All of the modes provided by the OFDM modem require a bandwidth of 2400 Hz and w
 
 There are currently five PTT options:
 - NONE (speaker/mic over the air)
-- Rigctl
+- Rigctl (Provided by hamlib, used on most HF rigs) https://github.com/Hamlib/Hamlib/releases/tag/4.7.2
 - VOX
 - Serial
 - CM108
@@ -144,6 +144,17 @@ modem73 supports the [AIOC](https://github.com/skuep/AIOC) out of the box. To us
 
 ### rigctl
 modem73 supports Hamlib and rigctl for any rigctl supported radio for PTT. Set rigctl to your options and run `rigctld -m (your model) -s (serial baud rate) -r COMx`  The `d` at the end of `rigctl` tells rigctl to run in network mode, which is what modem73 will connect to.
+
+On Windows, Hamlib which provides the rigctld.exe binary can be found at https://github.com/Hamlib/Hamlib/releases/tag/4.7.2
+
+Add the `bin` from Hamlib to your PATH and you can start rigctld from any terminal
+
+An example of rigctld running in the background that allows modem73 to key up and change the frequency for an ICOM-7300 looks like:
+`rigctld.exe -r COM3 -m 3073 -s 19200`
+
+Replace COM3 with whatever your radio is actually enumerated as.
+
+To verify your rigctl connection is working, you can omit the rigctld and just do rigctl.exe and run a command like "f" (lowercase, no quotes) to get the current frequency. The `-m` denotes model number. To find your model number run `rigctl.exe -l`
 
 ### Reticulum
 Want to use modem73 with Reticulum? Check out the modem73interface
