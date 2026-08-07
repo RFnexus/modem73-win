@@ -5,6 +5,7 @@
 #include <queue>
 #include <map>
 #include <mutex>
+#include <random>
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -62,7 +63,7 @@ struct TNCConfig {
     std::string callsign = "N0CALL";
     std::string modulation = "QPSK";
     std::string code_rate = "1/2";
-    int frame_size = 1;         // 0=short, 1=normal, 2=long
+    int frame_size = 1;         // 0=short, 1=normal, 2=long, 3=micro
     bool postamble = false;
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     
@@ -78,8 +79,8 @@ struct TNCConfig {
     int vox_lead_ms = 550;       // ms - tone before OFDM data
     int vox_tail_ms = 500;       // ms - tone after OFDM data
     
-    // COM/Serial PTT settings
-    std::string com_port = "COM1";
+    // COM/Serial PTT settings 
+    std::string com_port = "COM1"; 
     int com_ptt_line = 1;        // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
@@ -216,6 +217,10 @@ class PacketQueue {
 public:
     void push(T item) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (queue_.size() >= 256) {
+            std::cerr << "TX queue full (256), dropping frame" << std::endl;
+            return;
+        }
         queue_.push(std::move(item));
     }
     
@@ -435,7 +440,7 @@ namespace Frag {
 
 class Fragmenter {
 public:
-    Fragmenter() : next_packet_id_(0) {}
+    Fragmenter() : next_packet_id_((uint16_t)std::random_device{}()) {}
     
     std::vector<std::vector<uint8_t>> fragment(const std::vector<uint8_t>& data, size_t max_payload) {
         std::vector<std::vector<uint8_t>> fragments;
@@ -447,7 +452,10 @@ public:
         size_t data_per_frag = max_payload - Frag::HEADER_SIZE;
         size_t num_frags = (data.size() + data_per_frag - 1) / data_per_frag;
         if (num_frags > 255) {
-            num_frags = 255;
+            std::cerr << "Fragmenter: packet too large (" << data.size()
+                      << " bytes for " << data_per_frag
+                      << " byte fragments), dropped" << std::endl;
+            return {};
         }
         
         uint16_t packet_id = next_packet_id_++;
@@ -504,9 +512,21 @@ public:
         std::vector<uint8_t> payload(fragment.begin() + Frag::HEADER_SIZE, fragment.end());
         
         std::lock_guard<std::mutex> lock(mutex_);
-        
+
         cleanup_stale();
-        
+
+        {
+            auto pit = pending_.find(packet_id);
+            if (pit != pending_.end()) {
+                auto fit = pit->second.fragments.find(seq);
+                if (fit != pit->second.fragments.end() && fit->second != payload) {
+                    std::cerr << "Reassembler: fragment collision on packet id "
+                              << packet_id << ", discarding pending packet" << std::endl;
+                    pending_.erase(pit);
+                }
+            }
+        }
+
         auto& pkt = pending_[packet_id];
         if (pkt.fragments.empty()) {
             pkt.first_seen = std::chrono::steady_clock::now();
@@ -548,7 +568,11 @@ public:
     
     bool is_fragment(const std::vector<uint8_t>& data) const {
         if (data.size() < Frag::HEADER_SIZE) return false;
-        return data[0] == Frag::MAGIC;
+        if (data[0] != Frag::MAGIC) return false;
+        uint8_t flags = data[4];
+        if (flags & ~(Frag::FLAG_MORE_FRAGMENTS | Frag::FLAG_FIRST_FRAGMENT))
+            return false;
+        return ((flags & Frag::FLAG_FIRST_FRAGMENT) != 0) == (data[3] == 0);
     }
     
     void reset() {

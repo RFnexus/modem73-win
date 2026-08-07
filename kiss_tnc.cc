@@ -234,7 +234,8 @@ public:
         );
 
         if (modem_config_.call_sign < 0) {
-            throw std::runtime_error("Invalid callsign");
+            throw std::runtime_error("Invalid callsign '" + config.callsign +
+                                     "' (A-Z 0-9 / only, 1-9 characters)");
         }
         if (modem_config_.oper_mode < 0) {
             throw std::runtime_error("Invalid modulation or code rate");
@@ -251,9 +252,10 @@ public:
     }
     
     void run() {
-        audio_ = std::make_unique<MiniAudio>(config_.audio_input_device, 
+        audio_ = std::make_unique<MiniAudio>(config_.audio_input_device,
                                              config_.audio_output_device,
                                              config_.sample_rate);
+        audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
         if (!audio_->open_playback()) {
             throw std::runtime_error("Failed to open audio input");
         }
@@ -357,8 +359,12 @@ public:
         std::thread rx_thread(&KISSTNC::rx_loop, this);
         std::thread tx_thread(&KISSTNC::tx_loop, this);
         std::thread watchdog_thread(&KISSTNC::ptt_watchdog_loop, this);
-        
-        // Main  
+
+        int64_t last_audio_check_ms = 0;
+        int64_t next_audio_retry_ms = 0;
+        int64_t audio_retry_backoff_ms = 5000;
+
+        // Main
         while (g_running) {
             struct sockaddr_in client_addr;
             socklen_t client_len = sizeof(client_addr);
@@ -442,9 +448,28 @@ public:
                 }
             }
             
+            int64_t audio_now_ms = steady_now_ms();
+            if (audio_now_ms - last_audio_check_ms >= 1000) {
+                last_audio_check_ms = audio_now_ms;
+                if (audio_ && !audio_->is_healthy() && audio_now_ms >= next_audio_retry_ms) {
+                    ui_log("(!) Audio unhealthy - attempting reconnect");
+                    if (audio_->reconnect()) {
+                        audio_->set_tx_gain(config_.tx_drive);
+                        ui_log("Audio reconnected");
+                        audio_retry_backoff_ms = 5000;
+                        next_audio_retry_ms = 0;
+                    } else {
+                        next_audio_retry_ms = audio_now_ms + audio_retry_backoff_ms;
+                        ui_log("(!) Audio reconnect failed, retrying in " +
+                               std::to_string(audio_retry_backoff_ms / 1000) + "s");
+                        audio_retry_backoff_ms = std::min<int64_t>(audio_retry_backoff_ms * 2, 60000);
+                    }
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
+
         // Cleanup
         tx_running_ = false;
         rx_running_ = false;
@@ -1350,9 +1375,7 @@ private:
                         sum_sq += buffer[i] * buffer[i];
                     }
                     float rms = std::sqrt(sum_sq / n);
-                    float db = 20.0f * std::log10(rms + 1e-10f);
-
-                    g_ui_state->update_level(db, dcd_active_);
+                    g_ui_state->carrier_level_db = 20.0f * std::log10(rms + 1e-10f);
 
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
@@ -1391,10 +1414,12 @@ private:
                     }
                 }
 #endif
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
             }
         }
     }
-    
+
     void init_ptt_driver() {
         rigctl_.reset();
         serial_ptt_.reset();
@@ -1477,7 +1502,7 @@ private:
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
             ptt_unkey_retries_ = 0;
-            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX");
+            ui_log("(!) PTT unkey failed repeatedly - check the radio is not stuck in TX and that your PTT settings are correct");
         }
 
 #ifdef WITH_UI
@@ -1714,7 +1739,8 @@ public:
     }
 
     // Update config at runtime (called from UI)
-    void update_config(const TNCConfig& new_config) {
+    std::vector<std::string> update_config(const TNCConfig& new_config) {
+        std::vector<std::string> rejected;
         std::lock_guard<std::mutex> lock(config_mutex_);
         {
             config_.csma_enabled = new_config.csma_enabled;
@@ -1740,9 +1766,15 @@ public:
         
         // Update callsign if changed
         if (config_.callsign != new_config.callsign) {
-            config_.callsign = new_config.callsign;
-            modem_config_.call_sign = ModemConfig::encode_callsign(config_.callsign.c_str());
-            ui_log("Callsign changed to " + config_.callsign);
+            if (ModemConfig::valid_callsign(new_config.callsign.c_str())) {
+                config_.callsign = new_config.callsign;
+                modem_config_.call_sign = ModemConfig::encode_callsign(config_.callsign.c_str());
+                ui_log("Callsign changed to " + config_.callsign);
+            } else {
+                rejected.push_back("callsign");
+                ui_log("(!) Invalid callsign '" + new_config.callsign +
+                       "' (A-Z 0-9 / only, 1-9 chars), keeping " + config_.callsign);
+            }
         }
         
         // Update center frequency
@@ -1785,17 +1817,16 @@ public:
                             config_.frame_size != new_config.frame_size);
 
         if (mode_changed) {
-            config_.modulation = new_config.modulation;
-            config_.code_rate = new_config.code_rate;
-            config_.frame_size = new_config.frame_size;
-
             int new_mode = ModemConfig::encode_mode(
-                config_.modulation.c_str(),
-                config_.code_rate.c_str(),
-                config_.frame_size
+                new_config.modulation.c_str(),
+                new_config.code_rate.c_str(),
+                new_config.frame_size
             );
 
             if (new_mode >= 0) {
+                config_.modulation = new_config.modulation;
+                config_.code_rate = new_config.code_rate;
+                config_.frame_size = new_config.frame_size;
                 modem_config_.oper_mode = new_mode;
                 if (config_.modem_type == 0) {
                     payload_size_ = encoder_->get_payload_size(modem_config_.oper_mode);
@@ -1804,8 +1835,10 @@ public:
                        " " + ModemConfig::frame_size_name(config_.frame_size) +
                        " (" + std::to_string(encoder_->get_payload_size(modem_config_.oper_mode)) + " bytes)");
             } else {
-                ui_log("Invalid OFDM mode " + config_.modulation + " " + config_.code_rate +
-                       " " + ModemConfig::frame_size_name(config_.frame_size) + ", keeping previous");
+                rejected.push_back("modulation/code_rate/frame_size");
+                ui_log("(!) Invalid OFDM mode " + new_config.modulation + " " + new_config.code_rate +
+                       " " + ModemConfig::frame_size_name(new_config.frame_size) +
+                       ", keeping " + config_.modulation + " " + config_.code_rate);
             }
         }
 
@@ -1854,6 +1887,8 @@ public:
 #endif
             ptt_reinit_at_ms_.store(steady_now_ms() + PTT_REINIT_SETTLE_MS);
         }
+
+        return rejected;
     }
 
     TNCConfig get_config() {
@@ -1933,6 +1968,11 @@ public:
         return false;
     }
     
+    float get_audio_level() {
+        if (!audio_ || !audio_->capture_alive()) return -100.0f;
+        return audio_->instant_level_db(100);
+    }
+
     bool is_audio_healthy() const {
         if (audio_) return audio_->is_healthy();
         return false;
@@ -2553,9 +2593,23 @@ int main(int argc, char** argv) {
                 
 #endif
 
+                if (!ui_state.audio_input_device.empty() &&
+                    ui_state.audio_input_device.find_first_not_of("0123456789") == std::string::npos) {
+                    size_t legacy_idx = std::stoul(ui_state.audio_input_device) + 1;
+                    if (legacy_idx < ui_state.available_input_devices.size())
+                        ui_state.audio_input_device = ui_state.available_input_devices[legacy_idx];
+                }
+                if (!ui_state.audio_output_device.empty() &&
+                    ui_state.audio_output_device.find_first_not_of("0123456789") == std::string::npos) {
+                    size_t legacy_idx = std::stoul(ui_state.audio_output_device) + 1;
+                    if (legacy_idx < ui_state.available_output_devices.size())
+                        ui_state.audio_output_device = ui_state.available_output_devices[legacy_idx];
+                }
                 // Network settings
                 if (!cli_set.count("port"))
                     config.port = ui_state.port;
+                if (!cli_control_port)
+                    config.control_port = ui_state.control_port;
                 if (!cli_set.count("bind_address"))
                     config.bind_address = ui_state.bind_address;
                 if (!cli_set.count("control_bind_address"))
@@ -2621,6 +2675,7 @@ int main(int argc, char** argv) {
 #endif
                 // Network settings
                 ui_state.port = config.port;
+                ui_state.control_port = config.control_port;
                 ui_state.bind_address = config.bind_address;
                 ui_state.control_bind_address = config.control_bind_address;
 
@@ -2667,6 +2722,7 @@ int main(int argc, char** argv) {
         ui_state.cm108_device = config.cm108_device;
 #endif
         ui_state.port = config.port;
+        ui_state.control_port = config.control_port;
         ui_state.bind_address = config.bind_address;
         ui_state.control_bind_address = config.control_bind_address;
         for (size_t i = 0; i < MODULATION_OPTIONS.size(); ++i) {
@@ -2894,8 +2950,14 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_mode")) && cJSON_IsNumber(item)
                     && item->valueint >= 0 && item->valueint < ROBUST_MODE_COUNT)
                     new_config.robust_mode = item->valueint;
-                if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item))
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "callsign")) && cJSON_IsString(item)) {
+                    if (!ModemConfig::valid_callsign(item->valuestring)) {
+                        ui_log(std::string("(!) Control port: invalid callsign '") +
+                               item->valuestring + "' (A-Z 0-9 / only, 1-9 chars)");
+                        return false;
+                    }
                     new_config.callsign = item->valuestring;
+                }
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "modulation")) && cJSON_IsString(item))
                     new_config.modulation = item->valuestring;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "code_rate")) && cJSON_IsString(item))
@@ -2940,12 +3002,14 @@ int main(int argc, char** argv) {
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "robust_rx_enabled")) && cJSON_IsBool(item))
                     new_config.robust_rx_enabled = cJSON_IsTrue(item);
 
-                tnc.update_config(new_config);
+                auto rejected = tnc.update_config(new_config);
 
 #ifdef WITH_UI
-                // Sync config back to TUI state so the UI reflects changes
+                // Sync config back to TUI state so the UI reflects changes.
+                // Rejected fields keep whatever the TNC actually kept.
+                TNCConfig applied = tnc.get_config();
                 if (g_ui_state) {
-                    g_ui_state->callsign = new_config.callsign;
+                    g_ui_state->callsign = applied.callsign;
                     g_ui_state->modem_type_index = new_config.modem_type;
                     g_ui_state->mfsk_mode_index = new_config.mfsk_mode;
                     g_ui_state->robust_mode_index = new_config.robust_mode;
@@ -2965,14 +3029,14 @@ int main(int argc, char** argv) {
 
                     // Map modulation string back to index
                     for (size_t i = 0; i < MODULATION_OPTIONS.size(); i++) {
-                        if (MODULATION_OPTIONS[i] == new_config.modulation) {
+                        if (MODULATION_OPTIONS[i] == applied.modulation) {
                             g_ui_state->modulation_index = i;
                             break;
                         }
                     }
                     // Map code rate string back to index
                     for (size_t i = 0; i < CODE_RATE_OPTIONS.size(); i++) {
-                        if (CODE_RATE_OPTIONS[i] == new_config.code_rate) {
+                        if (CODE_RATE_OPTIONS[i] == applied.code_rate) {
                             g_ui_state->code_rate_index = i;
                             break;
                         }
@@ -2981,7 +3045,7 @@ int main(int argc, char** argv) {
                     g_ui_state->update_modem_info();
                 }
 #endif
-                return true;
+                return rejected.empty();
             };
 
             ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {
@@ -3062,6 +3126,10 @@ int main(int argc, char** argv) {
             // Set up audio reconnect callback
             ui_state.on_reconnect_audio = [&tnc]() -> bool {
                 return tnc.reconnect_audio();
+            };
+
+            ui_state.on_get_audio_level = [&tnc]() -> float {
+                return tnc.get_audio_level();
             };
 
             ui_state.on_alc_tune = [&tnc]() -> float {

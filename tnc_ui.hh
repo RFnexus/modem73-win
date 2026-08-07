@@ -36,7 +36,6 @@ extern "C" int PDC_get_columns(void);
 #include "phy/mfsk_modem.hh"
 #include "phy/robust_modem.hh"
 #include "perf_log.hh"
-#include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
 #endif
@@ -44,21 +43,27 @@ extern "C" int PDC_get_columns(void);
 constexpr size_t MAX_LOG_ENTRIES = 500;
 
 const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
-const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150"};
-const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)"};
+const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150", "RDM-QB"};
+const std::vector<std::string> ROBUST_MTU_OPTIONS = {"510 B", "170 B (short)", "30 B (micro)"};
 
-// robust_mode ints: 0-4 full-frame, 5-9 short-frame, 10/11 RDM-800/-800S.
+// robust_mode ints: 0-4 full-frame, 5-9 short-frame, 10/11 RDM-800/-800S,
+// 12 RDM-QB (micro burst, single size).
 // The UI shows a base-mode selector (index into ROBUST_MODE_OPTIONS above,
 // display order) plus a frame-size toggle; these map between the two.
 inline int robust_base_index(int mode) {
+    if (mode == 12) return 6;                       // RDM-QB micro
     if (mode >= 10) return 1;                       // RDM-800 family
     int fam = mode % 5;                             // 0-4 family order
     return fam == 0 ? 0 : fam + 1;                  // shifted past RDM-800
 }
 inline int robust_mode_of(int base, bool short_frame) {
+    if (base == 6) return 12;                       // RDM-QB is one size only
     if (base == 1) return short_frame ? 11 : 10;
     int fam = base == 0 ? 0 : base - 1;
     return fam + (short_frame ? 5 : 0);
+}
+inline int robust_mtu_index(int mode) {
+    return mode == 12 ? 2 : RobustParams::is_short((RobustMode)mode) ? 1 : 0;
 }
 
 struct CsmaPreset {
@@ -160,7 +165,7 @@ const RigMeterDef RIG_METERS[RIG_METER_COUNT] = {
 constexpr int RIG_METER_SWR = 1;
 constexpr float SWR_WARN_THRESHOLD = 2.5f;
 
-constexpr int UTILS_ACTION_COUNT = 11 + ALT_MODE_COUNT;
+constexpr int UTILS_ACTION_COUNT = 10 + ALT_MODE_COUNT;
 
 
 
@@ -177,7 +182,16 @@ struct TNCUIState {
     int alt_mode_mask = 0;
     int modulation_index = 1;  // default QPSK N 1/2
     int code_rate_index = 0;
-    int frame_size = 1;        // 0=short, 1=normal, 2=long
+    int frame_size = 1;        // 0=short, 1=normal, 2=long, 3=micro qpsk 1/2 only curent
+
+    // TODO
+    bool micro_allowed() const {
+        return modulation_index == 1 && code_rate_index == 0;
+    }
+    void clamp_micro() {
+        if (frame_size == 3 && !micro_allowed())
+            frame_size = 1;
+    }
     int center_freq = 1500;
     bool postamble = false;
 
@@ -210,6 +224,7 @@ struct TNCUIState {
     
     // Network
     int port = 8001;
+    int control_port = 8073;
     std::string bind_address = "0.0.0.0";
     std::string control_bind_address = "127.0.0.1";
 
@@ -292,7 +307,7 @@ struct TNCUIState {
         // OFDM modem
         int modulation_index;
         int code_rate_index;
-        int frame_size;        // 0=short, 1=normal, 2=long
+        int frame_size;        // 0=short, 1=normal, 2=long, 3=micro (QPSK 1/2 only)
         int center_freq;
         // CSMA
         bool csma_enabled;
@@ -410,6 +425,29 @@ struct TNCUIState {
             std::chrono::steady_clock::now().time_since_epoch()).count();
     }
 
+    static constexpr int WF_DECIM = 8;   // 48 kHz ->   6 kHz display spans 0-3 kHz
+    static constexpr int WF_RING = 1024;
+    std::atomic<bool> scope_active{false};
+    std::mutex wf_mutex;
+    float wf_ring[WF_RING] = {};
+    int wf_wpos = 0;
+    uint32_t wf_written = 0;
+    float wf_acc = 0.0f;
+    int wf_acc_n = 0;
+
+    void push_scope_audio(const float* samples, int n) {
+        std::lock_guard<std::mutex> lock(wf_mutex);
+        for (int i = 0; i < n; i++) {
+            wf_acc += samples[i];
+            if (++wf_acc_n == WF_DECIM) {
+                wf_ring[wf_wpos] = wf_acc * (1.0f / WF_DECIM);
+                wf_wpos = (wf_wpos + 1) % WF_RING;
+                wf_written++;
+                wf_acc = 0.0f;
+                wf_acc_n = 0;
+            }
+        }
+    }
 
     struct PacketInfo {
         bool is_tx;
@@ -567,7 +605,13 @@ struct TNCUIState {
         if (mod < 0 || mod > 7) mod = 1;
         if (rate < 0 || rate > 6) rate = 0;
 
-        if (rate == 5) {
+        if (frame_size == 3) {
+            // QB QPSK quickburst
+            bool valid = mod == 1 && rate == 0;
+            airtime_seconds = 0.59f;
+            mtu_bytes = valid ? 32 - 2 : 0;
+            bitrate_bps = valid ? (int)(32 * 8 / airtime_seconds) : 0;
+        } else if (rate == 5) {
             static const int payload_rep_short[8]  = {128, 256, 512, 512, 1024, 1024, 2048, 2048};
             static const int payload_rep_normal[8] = {256, 512, 1024, 1024, 2048, 0, 0, 0};
             static const int duration_rep_short[8]  = {2600, 1500, 3400, 1500, 3400, 2600, 4000, 3400};
@@ -685,10 +729,11 @@ struct TNCUIState {
     // Save settings
     bool save_settings() {
         if (config_file.empty()) return false;
-        
-        FILE* f = fopen(config_file.c_str(), "w");
+
+        std::string tmp = config_file + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "w");
         if (!f) return false;
-        
+
         fprintf(f, "# MODEM73 Settings\n");
         fprintf(f, "callsign=%s\n", callsign.c_str());
         fprintf(f, "modem_type=%d\n", modem_type_index);
@@ -737,13 +782,17 @@ struct TNCUIState {
 #endif
         fprintf(f, "# Network\n");
         fprintf(f, "port=%d\n", port);
+        fprintf(f, "control_port=%d\n", control_port);
         fprintf(f, "bind_address=%s\n", bind_address.c_str());
         fprintf(f, "control_bind_address=%s\n", control_bind_address.c_str());
         fprintf(f, "# Utils\n");
         fprintf(f, "random_data_size=%d\n", random_data_size);
         fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
-        
-        fclose(f);
+
+        if (fclose(f) != 0 || rename(tmp.c_str(), config_file.c_str()) != 0) {
+            remove(tmp.c_str());
+            return false;
+        }
         return true;
     }
     
@@ -790,7 +839,7 @@ struct TNCUIState {
                 else if (strcmp(key, "short_frame") == 0) frame_size = atoi(value) != 0 ? 0 : 1;
                 else if (strcmp(key, "frame_size") == 0) {
                     int v = atoi(value);
-                    if (v >= 0 && v <= 2) frame_size = v;
+                    if (v >= 0 && v <= 3) frame_size = v;
                 }
                 else if (strcmp(key, "center_freq") == 0) center_freq = 1500;
                 else if (strcmp(key, "postamble") == 0) postamble = atoi(value) != 0;
@@ -850,6 +899,10 @@ struct TNCUIState {
                     int v = atoi(value);
                     if (v >= 1 && v <= 65535) port = v;
                 }
+                else if (strcmp(key, "control_port") == 0) {
+                    int v = atoi(value);
+                    if (v >= 1 && v <= 65535) control_port = v;
+                }
                 else if (strcmp(key, "bind_address") == 0) bind_address = value;
                 else if (strcmp(key, "control_bind_address") == 0) control_bind_address = value;
                 else if (strcmp(key, "random_data_size") == 0) {
@@ -861,25 +914,27 @@ struct TNCUIState {
         }
         
         fclose(f);
+        clamp_micro();
         update_modem_info();
         return true;
     }
-    
+
 
     bool save_presets() {
         if (presets_file.empty()) return false;
         
-        FILE* f = fopen(presets_file.c_str(), "w");
+        std::string tmp = presets_file + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "w");
         if (!f) return false;
-        
+
         fprintf(f, "# MODEM73 Presets \n");
         for (const auto& p : presets) {
-            // sf field keeps legacy semantics: 1=short, 0=normal, 2=long
+            // 1=short, 0=normal, 2=long, 3=micro
             fprintf(f, "preset=%s,%d,%d,%d,%d,%d,%.1f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
                     p.name.c_str(),
                     p.modulation_index,
                     p.code_rate_index,
-                    p.frame_size == 0 ? 1 : p.frame_size == 2 ? 2 : 0,
+                    p.frame_size == 0 ? 1 : p.frame_size >= 2 ? p.frame_size : 0,
                     p.center_freq,
                     p.csma_enabled ? 1 : 0,
                     p.carrier_threshold_db,
@@ -894,8 +949,11 @@ struct TNCUIState {
                     p.robust_mode_index,
                     p.postamble ? 1 : 0);
         }
-        
-        fclose(f);
+
+        if (fclose(f) != 0 || rename(tmp.c_str(), presets_file.c_str()) != 0) {
+            remove(tmp.c_str());
+            return false;
+        }
         return true;
     }
     
@@ -933,7 +991,10 @@ struct TNCUIState {
                 p.name = name;
                 p.modulation_index = clampi(mod, 0, (int)MODULATION_OPTIONS.size() - 1);
                 p.code_rate_index = clampi(rate, 0, (int)CODE_RATE_OPTIONS.size() - 1);
-                p.frame_size = sf == 1 ? 0 : sf == 2 ? 2 : 1;
+                p.frame_size = sf == 1 ? 0 : (sf == 2 || sf == 3) ? sf : 1;
+                if (p.frame_size == 3 &&
+                    !(p.modulation_index == 1 && p.code_rate_index == 0))
+                    p.frame_size = 1;
                 p.center_freq = 1500;
                 p.csma_enabled = csma != 0;
                 p.carrier_threshold_db = thresh;
@@ -1005,6 +1066,7 @@ struct TNCUIState {
         modulation_index = p.modulation_index;
         code_rate_index = p.code_rate_index;
         frame_size = p.frame_size;
+        clamp_micro();
         csma_enabled = p.csma_enabled;
         carrier_threshold_db = p.carrier_threshold_db;
         slot_time_ms = p.slot_time_ms;
@@ -1033,18 +1095,23 @@ struct TNCUIState {
 
     std::mutex log_mutex;
     std::deque<std::string> log_entries;
-    
+    std::atomic<bool> log_unread_error{false};
+
     std::function<void(TNCUIState&)> on_settings_changed;
     std::function<void()> on_stop_requested;
-    std::function<bool()> on_reconnect_audio;  
+    std::function<bool()> on_reconnect_audio;
+    std::function<float()> on_get_audio_level;  
     
     void add_log(const std::string& msg) {
         std::lock_guard<std::mutex> lock(log_mutex);
         auto now = std::chrono::system_clock::now();
         auto time = std::chrono::system_clock::to_time_t(now);
+        struct tm tmv;
+        localtime_s(&tmv, &time);
         std::stringstream ss;
-        ss << std::put_time(std::localtime(&time), "%H:%M:%S") << "  " << msg;
+        ss << std::put_time(&tmv, "%H:%M:%S") << "  " << msg;
         log_entries.push_back(ss.str());
+        if (msg.rfind("(!)", 0) == 0) log_unread_error = true;
         if (log_entries.size() > MAX_LOG_ENTRIES) {
             log_entries.pop_front();
         }
@@ -1214,11 +1281,11 @@ public:
             _close(saved_stderr_);
         }
     }
-
+    
     void run() {
-        // set locale LC_ALL for Unicode character support,
+        // set locale LC_ALL for Unicode character support,  
         setlocale(LC_ALL, "");
-
+        
 
         saved_stderr_ = _dup(2);
         int devnull = _open("NUL", _O_WRONLY);
@@ -1226,7 +1293,7 @@ public:
             _dup2(devnull, 2);
             _close(devnull);
         }
-
+        
         initscr();
         initialized_ = true;
         cbreak();
@@ -1234,7 +1301,7 @@ public:
         keypad(stdscr, TRUE);
         nodelay(stdscr, TRUE);
         curs_set(0);
-
+        
         mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
         mouseinterval(0);
         
@@ -1247,24 +1314,39 @@ public:
             init_pair(4, COLOR_CYAN, -1);     // Important 
             init_pair(5, COLOR_WHITE, -1);    // Normal 
             init_pair(6, COLOR_MAGENTA, -1);  // Special
+
+            if (COLORS >= 256 && COLOR_PAIRS > WF_PAIR_BASE + 31) {
+                static const short grad[31] = {
+                    16, 17, 18, 19, 20, 21, 27, 33, 39, 45, 51,
+                    50, 49, 48, 47, 46, 82, 118, 154, 190, 226,
+                    220, 214, 208, 202, 196, 197, 198, 199, 200, 201};
+                for (int i = 0; i < 31; i++)
+                    init_pair(WF_PAIR_BASE + i, COLOR_BLACK, grad[i]);
+                wf_pairs_ = 31;
+            } else if (COLOR_PAIRS > WF_PAIR_BASE + 7) {
+                static const short grad[7] = {COLOR_BLACK, COLOR_BLUE, COLOR_CYAN,
+                                              COLOR_GREEN, COLOR_YELLOW, COLOR_RED,
+                                              COLOR_MAGENTA};
+                for (int i = 0; i < 7; i++)
+                    init_pair(WF_PAIR_BASE + i, COLOR_BLACK, grad[i]);
+                wf_pairs_ = 7;
+            }
         }
         
         running_ = true;
-
-        // marker so a running build can be identified as resize-aware
-        state_.add_log("UI: console resize watch v2 (" +
-                       std::to_string(COLS) + "x" + std::to_string(LINES) + ")");
-
+        
         while (running_ && g_running) {
             int ch = getch();
             if (handle_resize(ch)) {
-                clear();
-            } else if (ch != ERR) {
-                handle_input(ch);
+                continue;
             }
-            if (poll_resize())
-                clear();
+            if (ch != ERR) {
+                handle_input(ch);
+            } else if (poll_resize()) {
+                continue;
+            }
             tick_auto_send();
+            tick_level_history();
             draw();
             if (rx_off_dialog_field_ >= 0)
                 draw_rx_off_dialog();
@@ -1274,7 +1356,7 @@ public:
         
         endwin();
         initialized_ = false;
-
+        
 
         if (saved_stderr_ >= 0) {
             _dup2(saved_stderr_, 2);
@@ -1326,6 +1408,7 @@ private:
         FIELD_CM108_DEVICE,
 #endif
         FIELD_NET_PORT,
+        FIELD_CONTROL_PORT,
         FIELD_PRESET,
         FIELD_COUNT
     };
@@ -1588,6 +1671,9 @@ private:
 
                         edit_text_field(FIELD_NET_PORT);
 
+                    } else if (current_field_ == FIELD_CONTROL_PORT) {
+
+                        edit_text_field(FIELD_CONTROL_PORT);
 
                     } else if (current_field_ == FIELD_COM_PORT) {
 
@@ -1595,7 +1681,6 @@ private:
                         show_com_port_dialog();
 
                     } else if (current_field_ == FIELD_PTT_TYPE) {
-
 
                         show_ptt_type_dialog();
 
@@ -1776,17 +1861,27 @@ private:
                     current_field_ = field;
                     
                     // Handle clicks on interactive elements
-                    if (field == FIELD_PRESET) {
+                    if (field == FIELD_MODEM_TYPE) {
+                        int idx = modem_tab_at(event.x, cols);
+                        if (idx >= 0) {
+                            if (idx != state_.modem_type_index) {
+                                state_.modem_type_index = idx;
+                                apply_settings();
+                            }
+                        } else if (event.x >= 18) {
+                            adjust_field(event.x < 22 ? -1 : 1);
+                        }
+                    } else if (field == FIELD_PRESET) {
                         // Click on preset - determine action by position
-                        if (event.x >= 18 && event.x < 22 && !state_.presets.empty()) {
+                        if (event.x >= 15 && event.x < 18 && !state_.presets.empty()) {
                             // Left arrow
                             state_.selected_preset--;
-                            if (state_.selected_preset < 0) 
+                            if (state_.selected_preset < 0)
                                 state_.selected_preset = state_.presets.size() - 1;
-                        } else if (event.x >= 22 && event.x < 38 && !state_.presets.empty()) {
+                        } else if (event.x >= 18 && event.x < 28 && !state_.presets.empty()) {
                             // Name area - load on click
                             load_selected_preset();
-                        } else if (event.x >= 38 && !state_.presets.empty()) {
+                        } else if (event.x >= 28 && event.x < 34 && !state_.presets.empty()) {
                             // Right arrow area
                             state_.selected_preset++;
                             if (state_.selected_preset >= (int)state_.presets.size())
@@ -1796,6 +1891,8 @@ private:
                         // Value area clicks for other fields
                         if (field == FIELD_CALLSIGN) {
                             edit_text_field(field);
+                        } else if (field == FIELD_PTT_TYPE) {
+                            show_ptt_type_dialog();
                         } else if (field >= FIELD_MODULATION) {
                             if (event.x < 22) adjust_field(-1);
                             else adjust_field(1);
@@ -1839,12 +1936,13 @@ private:
             refresh();
 
             int ch = getch();
-            if (handle_resize(ch)) {
+
+            if (handle_resize(ch) || (ch == ERR && poll_resize())) {
+                clear();
+                draw();
                 continue;
-            } else if (ch == ERR) {
-                poll_resize();
-                continue;
-            } else if (ch == 27) {
+            }
+            if (ch == 27) {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
                 accepted = true;
@@ -1863,38 +1961,27 @@ private:
     }
 
     void edit_text_field(int field) {
-        // MODEM:4, Callsign:5, Mod:6, Rate:7, Frame:8, Freq:9
-        // CSMA:11, Enabled:12, Thresh:13, Persist:14
-        // AUDIO:16, Input:17, Output:18, PTT:19
-        // VOX:20-21 (if PTT=VOX), COM:20-22 (if PTT=COM)
-        
-        int row = -1;
         int col = 16;
-        int max_len = 10;
-        
+        int max_len;
+
         if (field == FIELD_CALLSIGN) {
-            row = 5;
-            max_len = 10;
+            max_len = 9;
         } else if (field == FIELD_COM_PORT) {
-            row = 20;  
             max_len = 20;
 #ifdef WITH_CM108
         } else if (field == FIELD_CM108_GPIO) {
-            row = 20;  
             max_len = 1;
 #endif
         } else if (field == FIELD_NET_PORT) {
-            if (state_.ptt_type_index == 2) {  //2 extra rows
-                row = 24;
-            } else if (state_.ptt_type_index == 3) {  
-                row = 25;
-            } else {
-                row = 22;  
-            }
+            max_len = 5;
+        } else if (field == FIELD_CONTROL_PORT) {
             max_len = 5;
         } else {
             return; // not text editable
         }
+
+        int row = 4 + config_field_row(field) - config_scroll_;
+        if (row < 4) return;
         
         // Clear the value area
         move(row, col);
@@ -1906,6 +1993,12 @@ private:
         if (strlen(buf) > 0) {
             if (field == FIELD_CALLSIGN) {
                 for (char* p = buf; *p; p++) *p = toupper(*p);
+                if (!ModemConfig::valid_callsign(buf)) {
+                    state_.add_log(std::string("(!) Invalid callsign '") + buf +
+                                   "' (A-Z 0-9 / only, 1-9 chars), keeping " +
+                                   state_.callsign);
+                    return;
+                }
                 state_.callsign = buf;
                 apply_settings();
             } else if (field == FIELD_COM_PORT) {
@@ -1927,7 +2020,16 @@ private:
                     int port = std::stoi(buf);
                     if (port >= 1024 && port <= 65535) {
                         state_.port = port;
-                        state_.add_log("(!) Port changed, restart required");
+                        state_.add_log("(!) KISS port changed, restart required");
+                        apply_settings();
+                    }
+                } catch (...) {}
+            } else if (field == FIELD_CONTROL_PORT) {
+                try {
+                    int port = std::stoi(buf);
+                    if (port >= 1024 && port <= 65535) {
+                        state_.control_port = port;
+                        state_.add_log("(!) Control port changed, restart required");
                         apply_settings();
                     }
                 } catch (...) {}
@@ -2105,6 +2207,8 @@ private:
         row++;
         row++;
         if (field == FIELD_NET_PORT) return row;
+        row++;
+        if (field == FIELD_CONTROL_PORT) return row;
         row += 2;
         row++;
         if (field == FIELD_PRESET) return row;
@@ -2163,15 +2267,19 @@ private:
                 break;
             case FIELD_MODULATION:
                 state_.modulation_index = (state_.modulation_index + delta + 8) % 8;
+                state_.clamp_micro();
                 break;
             case FIELD_CODERATE:
                 do {
                     state_.code_rate_index = (state_.code_rate_index + delta +
                         (int)CODE_RATE_OPTIONS.size()) % (int)CODE_RATE_OPTIONS.size();
                 } while (state_.code_rate_index >= 5);
+                state_.clamp_micro();
                 break;
             case FIELD_FRAMESIZE:
-                state_.frame_size = (state_.frame_size + delta + 3) % 3;
+                do {
+                    state_.frame_size = (state_.frame_size + delta + 4) % 4;
+                } while (state_.frame_size == 3 && !state_.micro_allowed());
                 break;
             case FIELD_POSTAMBLE:
                 state_.postamble = !state_.postamble;
@@ -2246,7 +2354,7 @@ private:
             case FIELD_AUDIO_OUTPUT:
                 break;
             case FIELD_PTT_TYPE:
-                break;  // Enter opens the PTT type dialog
+                break;
             case FIELD_VOX_FREQ:
                 state_.vox_tone_freq += delta * 100;
                 state_.vox_tone_freq = std::max(300, std::min(2500, state_.vox_tone_freq));
@@ -2314,111 +2422,76 @@ private:
         state_.save_settings();
     }
     
-    void show_device_select_dialog(bool is_input) {
+    void show_ptt_type_dialog() {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
-        
-        const std::vector<std::string>& devices = is_input ? 
-            state_.available_input_devices : state_.available_output_devices;
-        const std::vector<std::string>& descriptions = is_input ?
-            state_.input_device_descriptions : state_.output_device_descriptions;
-        int& current_index = is_input ? state_.audio_input_index : state_.audio_output_index;
-        std::string& current_device = is_input ? state_.audio_input_device : state_.audio_output_device;
-        
-        if (devices.empty()) {
-            state_.add_log("No audio devices found");
-            return;
-        }
-        
-        // Dialog dimensions
-        int dialog_w = std::min(cols - 4, 58);
-        int max_visible = std::min((int)devices.size(), 12);
-        int dialog_h = max_visible + 3;
+
+        static const char* const descriptions[] = {
+            "NONE   - PTT disabled (over the air)",
+            "RIGCTL - Hamlib rigctld (network)",
+            "VOX    - Tone-keyed VOX",
+            "COM    - Serial port DTR/RTS",
+#ifdef WITH_CM108
+            "CM108  - USB HID GPIO",
+#endif
+        };
+        int count = (int)PTT_TYPE_OPTIONS.size();
+
+        int selection = state_.ptt_type_index;
+        if (selection < 0 || selection >= count) selection = 0;
+
+        int dialog_w = std::min(cols - 4, 42);
+        int dialog_h = count + 3;
         int dialog_x = (cols - dialog_w) / 2;
         int dialog_y = (rows - dialog_h) / 2;
-        
-        int selection = current_index;
-        int scroll_offset = 0;
-        
-        if (selection >= max_visible) {
-            scroll_offset = selection - max_visible + 1;
-        }
-        
+
         timeout(250);  // finite wait so poll_resize() runs while idle
-        
+
         while (true) {
-            // Clear dialog area
             for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
                 move(y, dialog_x);
                 for (int x = 0; x < dialog_w; x++) addch(' ');
             }
-            
-            // Draw box
+
             attron(COLOR_PAIR(4) | A_BOLD);
             draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
+            const char* title = " PTT Type ";
+            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
             attroff(COLOR_PAIR(4) | A_BOLD);
-            
-            // Title
-            const char* title = is_input ? " Input Device " : " Output Device ";
-            attron(COLOR_PAIR(4) | A_BOLD);
-            mvaddstr(dialog_y, dialog_x + (dialog_w - strlen(title)) / 2, title);
-            attroff(COLOR_PAIR(4) | A_BOLD);
-            
-            // Draw device list
-            int visible_count = std::min((int)devices.size() - scroll_offset, max_visible);
-            for (int i = 0; i < visible_count; i++) {
-                int dev_idx = scroll_offset + i;
+
+            for (int i = 0; i < count; i++) {
                 int y = dialog_y + 1 + i;
-                
                 mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
-                
-                if (dev_idx == selection) {
+
+                if (i == selection) {
                     attron(COLOR_PAIR(4) | A_BOLD);
                     mvaddstr(y, dialog_x + 1, "> ");
                 } else {
                     mvaddstr(y, dialog_x + 1, "  ");
                 }
-                
-                std::string desc = (dev_idx < (int)descriptions.size()) ? 
-                    descriptions[dev_idx] : devices[dev_idx];
+
+                std::string desc = (i < (int)(sizeof(descriptions) / sizeof(descriptions[0]))) ?
+                    descriptions[i] : PTT_TYPE_OPTIONS[i];
                 int max_len = dialog_w - 4;
                 if ((int)desc.length() > max_len) {
                     desc = desc.substr(0, max_len - 2) + "..";
                 }
                 addstr(desc.c_str());
-                
-                if (dev_idx == selection) {
+
+                if (i == selection) {
                     attroff(COLOR_PAIR(4) | A_BOLD);
                 }
             }
-            
-            // Scroll indicators
-            if (scroll_offset > 0) {
-                attron(A_DIM);
-                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
-                attroff(A_DIM);
-            }
-            if (scroll_offset + max_visible < (int)devices.size()) {
-                attron(A_DIM);
-                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
-                attroff(A_DIM);
-            }
-            
-            // Help
+
             attron(A_DIM);
             mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
-            mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 15, "(needs restart)");
             attroff(A_DIM);
-            
+
             refresh();
-            
+
             int ch = getch();
 
             if (handle_resize(ch) || (ch == ERR && poll_resize())) {
-                getmaxyx(stdscr, rows, cols);
-                dialog_w = std::min(cols - 4, 58);
-                dialog_x = (cols - dialog_w) / 2;
-                dialog_y = (rows - dialog_h) / 2;
                 clear();
                 draw();
                 continue;
@@ -2427,37 +2500,19 @@ private:
             if (ch == 27 || ch == 'q') {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
-                if (selection >= 0 && selection < (int)devices.size()) {
-                    current_index = selection;
-                    current_device = devices[selection];
-                    state_.add_log(std::string(is_input ? "In: " : "Out: ") + 
-                                   descriptions[selection] + " (restart to apply)");
+                if (selection != state_.ptt_type_index) {
+                    state_.ptt_type_index = selection;
+                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[selection]);
                     apply_settings();
                 }
                 break;
             } else if (ch == KEY_UP || ch == 'k') {
-                if (selection > 0) {
-                    selection--;
-                    if (selection < scroll_offset) scroll_offset = selection;
-                }
+                if (selection > 0) selection--;
             } else if (ch == KEY_DOWN || ch == 'j') {
-                if (selection < (int)devices.size() - 1) {
-                    selection++;
-                    if (selection >= scroll_offset + max_visible) {
-                        scroll_offset = selection - max_visible + 1;
-                    }
-                }
-            } else if (ch == KEY_PPAGE) {
-                selection = std::max(0, selection - max_visible);
-                scroll_offset = std::max(0, scroll_offset - max_visible);
-            } else if (ch == KEY_NPAGE) {
-                selection = std::min((int)devices.size() - 1, selection + max_visible);
-                if (selection >= scroll_offset + max_visible) {
-                    scroll_offset = selection - max_visible + 1;
-                }
+                if (selection < count - 1) selection++;
             }
         }
-        
+
         nodelay(stdscr, TRUE);
     }
 
@@ -2625,104 +2680,146 @@ private:
             edit_text_field(FIELD_COM_PORT);
         }
     }
-
-    void show_ptt_type_dialog() {
+    void show_device_select_dialog(bool is_input) {
         int rows, cols;
         getmaxyx(stdscr, rows, cols);
-
-        static const char* const descriptions[] = {
-            "NONE   - PTT disabled (over the air)",
-            "RIGCTL - Hamlib rigctld (network)",
-            "VOX    - Tone-keyed VOX",
-            "COM    - Serial port DTR/RTS",
-#ifdef WITH_CM108
-            "CM108  - USB HID GPIO",
-#endif
-        };
-        int count = (int)PTT_TYPE_OPTIONS.size();
-
-        int selection = state_.ptt_type_index;
-        if (selection < 0 || selection >= count) selection = 0;
-
-        int dialog_w = std::min(cols - 4, 42);
-        int dialog_h = count + 3;
+        
+        const std::vector<std::string>& devices = is_input ? 
+            state_.available_input_devices : state_.available_output_devices;
+        const std::vector<std::string>& descriptions = is_input ?
+            state_.input_device_descriptions : state_.output_device_descriptions;
+        int& current_index = is_input ? state_.audio_input_index : state_.audio_output_index;
+        std::string& current_device = is_input ? state_.audio_input_device : state_.audio_output_device;
+        
+        if (devices.empty()) {
+            state_.add_log("No audio devices found");
+            return;
+        }
+        
+        // Dialog dimensions
+        int dialog_w = std::min(cols - 4, 58);
+        int max_visible = std::min((int)devices.size(), 12);
+        int dialog_h = max_visible + 3;
         int dialog_x = (cols - dialog_w) / 2;
         int dialog_y = (rows - dialog_h) / 2;
-
+        
+        int selection = current_index;
+        int scroll_offset = 0;
+        
+        if (selection >= max_visible) {
+            scroll_offset = selection - max_visible + 1;
+        }
+        
         timeout(250);  // finite wait so poll_resize() runs while idle
-
+        
         while (true) {
+            // Clear dialog area
             for (int y = dialog_y; y < dialog_y + dialog_h; y++) {
                 move(y, dialog_x);
                 for (int x = 0; x < dialog_w; x++) addch(' ');
             }
-
+            
+            // Draw box
             attron(COLOR_PAIR(4) | A_BOLD);
             draw_box(dialog_y, dialog_x, dialog_h, dialog_w);
             attroff(COLOR_PAIR(4) | A_BOLD);
-
-            const char* title = " PTT Type ";
+            
+            // Title
+            const char* title = is_input ? " Input Device " : " Output Device ";
             attron(COLOR_PAIR(4) | A_BOLD);
-            mvaddstr(dialog_y, dialog_x + (dialog_w - (int)strlen(title)) / 2, title);
+            mvaddstr(dialog_y, dialog_x + (dialog_w - strlen(title)) / 2, title);
             attroff(COLOR_PAIR(4) | A_BOLD);
-
-            for (int i = 0; i < count; i++) {
+            
+            // Draw device list
+            int visible_count = std::min((int)devices.size() - scroll_offset, max_visible);
+            for (int i = 0; i < visible_count; i++) {
+                int dev_idx = scroll_offset + i;
                 int y = dialog_y + 1 + i;
+                
                 mvhline(y, dialog_x + 1, ' ', dialog_w - 2);
-
-                if (i == selection) {
+                
+                if (dev_idx == selection) {
                     attron(COLOR_PAIR(4) | A_BOLD);
                     mvaddstr(y, dialog_x + 1, "> ");
                 } else {
                     mvaddstr(y, dialog_x + 1, "  ");
                 }
-
-                std::string desc = descriptions[i];
+                
+                std::string desc = (dev_idx < (int)descriptions.size()) ? 
+                    descriptions[dev_idx] : devices[dev_idx];
                 int max_len = dialog_w - 4;
                 if ((int)desc.length() > max_len) {
                     desc = desc.substr(0, max_len - 2) + "..";
                 }
                 addstr(desc.c_str());
-
-                if (i == selection) {
+                
+                if (dev_idx == selection) {
                     attroff(COLOR_PAIR(4) | A_BOLD);
                 }
             }
-
+            
+            // Scroll indicators
+            if (scroll_offset > 0) {
+                attron(A_DIM);
+                mvaddstr(dialog_y, dialog_x + dialog_w - 3, "^");
+                attroff(A_DIM);
+            }
+            if (scroll_offset + max_visible < (int)devices.size()) {
+                attron(A_DIM);
+                mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 3, "v");
+                attroff(A_DIM);
+            }
+            
+            // Help
             attron(A_DIM);
             mvaddstr(dialog_y + dialog_h - 1, dialog_x + 2, " Enter=OK  Esc=Cancel ");
+            mvaddstr(dialog_y + dialog_h - 1, dialog_x + dialog_w - 15, "(needs restart)");
             attroff(A_DIM);
-
+            
             refresh();
-
+            
             int ch = getch();
 
             if (handle_resize(ch) || (ch == ERR && poll_resize())) {
-                getmaxyx(stdscr, rows, cols);
-                dialog_w = std::min(cols - 4, 42);
-                dialog_x = (cols - dialog_w) / 2;
-                dialog_y = (rows - dialog_h) / 2;
                 clear();
                 draw();
                 continue;
             }
-
+            
             if (ch == 27 || ch == 'q') {
                 break;
             } else if (ch == '\n' || ch == KEY_ENTER) {
-                if (selection != state_.ptt_type_index) {
-                    state_.ptt_type_index = selection;
-                    state_.add_log("PTT: " + PTT_TYPE_OPTIONS[selection]);
+                if (selection >= 0 && selection < (int)devices.size()) {
+                    current_index = selection;
+                    current_device = devices[selection];
+                    state_.add_log(std::string(is_input ? "In: " : "Out: ") + 
+                                   descriptions[selection] + " (restart to apply)");
                     apply_settings();
                 }
                 break;
             } else if (ch == KEY_UP || ch == 'k') {
-                if (selection > 0) selection--;
+                if (selection > 0) {
+                    selection--;
+                    if (selection < scroll_offset) scroll_offset = selection;
+                }
             } else if (ch == KEY_DOWN || ch == 'j') {
-                if (selection < count - 1) selection++;
+                if (selection < (int)devices.size() - 1) {
+                    selection++;
+                    if (selection >= scroll_offset + max_visible) {
+                        scroll_offset = selection - max_visible + 1;
+                    }
+                }
+            } else if (ch == KEY_PPAGE) {
+                selection = std::max(0, selection - max_visible);
+                scroll_offset = std::max(0, scroll_offset - max_visible);
+            } else if (ch == KEY_NPAGE) {
+                selection = std::min((int)devices.size() - 1, selection + max_visible);
+                if (selection >= scroll_offset + max_visible) {
+                    scroll_offset = selection - max_visible + 1;
+                }
             }
         }
-
+        
         nodelay(stdscr, TRUE);
     }
 
@@ -2845,10 +2942,6 @@ private:
             int ch = getch();
 
             if (handle_resize(ch) || (ch == ERR && poll_resize())) {
-                getmaxyx(stdscr, rows, cols);
-                dialog_w = std::min(cols - 4, 58);
-                dialog_x = (cols - dialog_w) / 2;
-                dialog_y = (rows - dialog_h) / 2;
                 clear();
                 draw();
                 continue;
@@ -2995,6 +3088,7 @@ private:
                 last_ptt_seen_ms_ = now_ms;
             state_.rig_poll_enabled = (current_tab_ == 5) || (current_tab_ == 0) ||
                 (last_ptt_seen_ms_ > 0 && now_ms - last_ptt_seen_ms_ < 3000);
+            state_.scope_active = (current_tab_ == 4);
             if (now_ms - occ_hist_ms_ >= 5000) {
                 occ_hist_ms_ = now_ms;
                 occ_hist_[occ_hist_pos_] = state_.channel_occupancy.load();
@@ -3070,7 +3164,8 @@ private:
             printw("  %s %s %s %dHz",
                    MODULATION_OPTIONS[state_.modulation_index].c_str(),
                    CODE_RATE_OPTIONS[state_.code_rate_index].c_str(),
-                   state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L" : "N",
+                   state_.frame_size == 0 ? "S" : state_.frame_size == 2 ? "L"
+                 : state_.frame_size == 3 ? "U" : "N",
                    state_.center_freq);
         }
         
@@ -3121,7 +3216,9 @@ private:
         else
 
             snprintf(utils_tab, sizeof(utils_tab), "UTILS");
-        const char* tabs[] = {"STATUS", "CONFIG", "LOG", utils_tab, "SCOPE", "RIG"};
+        bool log_err = state_.log_unread_error.load() && current_tab_ != 2;
+        const char* log_tab = log_err ? "LOG (!)" : "LOG";
+        const char* tabs[] = {"STATUS", "CONFIG", log_tab, utils_tab, "SCOPE", "RIG"};
         int ntabs = tab_count();
         int tab_width = (cols - 4) / ntabs;
 
@@ -3135,9 +3232,11 @@ private:
                 attroff(A_BOLD);
             } else {
                 if (i == 3 && unread > 0) attron(COLOR_PAIR(4) | A_BOLD);
+                else if (i == 2 && log_err) attron(COLOR_PAIR(3) | A_BOLD);
                 else attron(A_DIM);
                 mvprintw(2, tx, "  %s", tabs[i]);
                 if (i == 3 && unread > 0) attroff(COLOR_PAIR(4) | A_BOLD);
+                else if (i == 2 && log_err) attroff(COLOR_PAIR(3) | A_BOLD);
                 else attroff(A_DIM);
             }
         }
@@ -3887,8 +3986,7 @@ private:
         row++;
 
         dy = visible_y(row);
-        if (dy >= 0) draw_selector_field(dy, c1, c2, "Modem", FIELD_MODEM_TYPE,
-                           MODEM_TYPE_OPTIONS[state_.modem_type_index]);
+        if (dy >= 0) draw_modem_tabs(dy, c1, c2, divider);
         row++;
 
         if (state_.modem_type_index == 0) {
@@ -3905,7 +4003,8 @@ private:
 
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame Size", FIELD_FRAMESIZE,
-                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG" : "NORMAL");
+                               state_.frame_size == 0 ? "SHORT" : state_.frame_size == 2 ? "LONG"
+                             : state_.frame_size == 3 ? "MICRO" : "NORMAL");
             row++;
 
             dy = visible_y(row);
@@ -3924,8 +4023,7 @@ private:
             row++;
             dy = visible_y(row);
             if (dy >= 0) draw_selector_field(dy, c1, c2, "Frame", FIELD_ROBUST_MTU,
-                               ROBUST_MTU_OPTIONS[RobustParams::is_short(
-                                   (RobustMode)state_.robust_mode_index) ? 1 : 0]);
+                               ROBUST_MTU_OPTIONS[robust_mtu_index(state_.robust_mode_index)]);
             row++;
         }
 
@@ -4255,7 +4353,15 @@ private:
         if (dy >= 0) {
             char port_buf[32];
             snprintf(port_buf, sizeof(port_buf), "%d", state_.port);
-            draw_field(dy, c1, c2, "Port", FIELD_NET_PORT, port_buf, true);
+            draw_field(dy, c1, c2, "KISS Port", FIELD_NET_PORT, port_buf, true);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            char cport_buf[32];
+            snprintf(cport_buf, sizeof(cport_buf), "%d", state_.control_port);
+            draw_field(dy, c1, c2, "Control Port", FIELD_CONTROL_PORT, cport_buf, true);
         }
         row += 2;
         
@@ -4461,10 +4567,17 @@ private:
             attroff(A_DIM);
             y++;
             
-            mvprintw(y, c3, "%s %s %s",
-                     MODULATION_OPTIONS[p.modulation_index].c_str(),
-                     CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
-                     p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L" : "N");
+            if (p.modem_type_index == 1) {
+                mvprintw(y, c3, "%s", MFSK_MODE_OPTIONS[p.mfsk_mode_index].c_str());
+            } else if (p.modem_type_index == 2) {
+                mvprintw(y, c3, "%s", ROBUST_MODE_OPTIONS[p.robust_mode_index].c_str());
+            } else {
+                mvprintw(y, c3, "%s %s %s",
+                         MODULATION_OPTIONS[p.modulation_index].c_str(),
+                         CODE_RATE_OPTIONS[p.code_rate_index].c_str(),
+                         p.frame_size == 0 ? "S" : p.frame_size == 2 ? "L"
+                       : p.frame_size == 3 ? "U" : "N");
+            }
             y++;
             
             mvaddstr(y, c3, "PTT ");
@@ -4561,7 +4674,55 @@ private:
             mvprintw(y, c2, "  %s", value.c_str());
         }
     }
-    
+
+    // which modem family tab is on screen
+    int modem_tab_at(int x, int cols) {
+        int c2 = 16, divider = cols / 2 - 2, total = 0;
+        for (const auto& o : MODEM_TYPE_OPTIONS)
+            total += (int)o.size() + 2;
+        if (c2 + total > divider)
+            return -1;
+        int cx = c2;
+        for (int i = 0; i < (int)MODEM_TYPE_OPTIONS.size(); ++i) {
+            int w = (int)MODEM_TYPE_OPTIONS[i].size() + 2;
+            if (x >= cx && x < cx + w)
+                return i;
+            cx += w;
+        }
+        return -1;
+    }
+
+    void draw_modem_tabs(int y, int c1, int c2, int right_limit) {
+        bool sel = (FIELD_MODEM_TYPE == current_field_);
+        int total = 0;
+        for (const auto& o : MODEM_TYPE_OPTIONS)
+            total += (int)o.size() + 2;
+        if (c2 + total > right_limit) {
+            draw_selector_field(y, c1, c2, "Modem", FIELD_MODEM_TYPE,
+                                MODEM_TYPE_OPTIONS[state_.modem_type_index]);
+            return;
+        }
+        if (sel) {
+            attron(A_BOLD);
+            mvaddch(y, c1 - 2, '>');
+        }
+        mvaddstr(y, c1, "Modem");
+        if (sel) attroff(A_BOLD);
+        move(y, c2);
+        for (int i = 0; i < (int)MODEM_TYPE_OPTIONS.size(); ++i) {
+            bool active = (i == state_.modem_type_index);
+            if (active) {
+                attron(COLOR_PAIR(6) | A_BOLD | A_REVERSE);
+                printw(" %s ", MODEM_TYPE_OPTIONS[i].c_str());
+                attroff(COLOR_PAIR(6) | A_BOLD | A_REVERSE);
+            } else {
+                attron(A_DIM);
+                printw(" %s ", MODEM_TYPE_OPTIONS[i].c_str());
+                attroff(A_DIM);
+            }
+        }
+    }
+
     void draw_toggle_field(int y, int c1, int c2, const char* label, int field, bool value) {
         bool sel = (field == current_field_);
         
@@ -4663,15 +4824,16 @@ private:
         int visible = h - 1;
         int max_scroll = std::max(0, (int)log.size() - visible);
         log_scroll_ = std::min(log_scroll_, max_scroll);
-        
+
         int text_width = cols - 5;
-        
+
         for (int i = 0; i < visible && (log_scroll_ + i) < (int)log.size(); i++) {
             const std::string& line = log[log_scroll_ + i];
-            
+
             int pair = 0;
             bool bold = false;
-            if (line.find("TX:") != std::string::npos) { pair = 2; bold = true; }
+            if (line.size() > 12 && line.compare(10, 3, "(!)") == 0) { pair = 3; bold = true; }
+            else if (line.find("TX:") != std::string::npos) { pair = 2; bold = true; }
             else if (line.find("RX:") != std::string::npos) { pair = 1; bold = true; }
             else if (line.find("CSMA") != std::string::npos) pair = 3;
             else if (line.find("error") != std::string::npos || 
@@ -4691,7 +4853,9 @@ private:
             if (bold) attroff(A_BOLD);
             if (pair) attroff(COLOR_PAIR(pair));
         }
-        
+
+        state_.log_unread_error = false;
+
         // scrollbar based on dims
         if ((int)log.size() > visible && visible > 2) {
             int sb_height = visible;
@@ -4874,9 +5038,148 @@ private:
         }
     }
     
+    void update_waterfall() {
+
+        int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now_ms - wf_row_ms_ < WF_ROW_MS)
+            return;
+
+        static constexpr int SEGS = 6;
+        static constexpr int HOP = WF_FFT / 2;
+        static constexpr int SPAN = WF_FFT + HOP * (SEGS - 1);
+        float tdom[SPAN];
+        {
+            std::lock_guard<std::mutex> lock(state_.wf_mutex);
+            if (state_.wf_written == wf_seen_)
+                return;
+            wf_seen_ = state_.wf_written;
+            int p = state_.wf_wpos;
+            for (int i = 0; i < SPAN; i++)
+                tdom[i] = state_.wf_ring[(p + TNCUIState::WF_RING - SPAN + i)
+                                         % TNCUIState::WF_RING];
+        }
+
+
+
+        wf_row_ms_ = now_ms;
+
+        static const auto window = [] {
+            std::array<float, WF_FFT> w{};
+            for (int i = 0; i < WF_FFT; i++)
+                w[i] = 0.5f - 0.5f * std::cos(2.0f * (float)M_PI * i / WF_FFT);
+            return w;
+        }();
+
+        float pwr[WF_BINS] = {};
+        float seg[WF_FFT];
+        std::complex<float> fdom[WF_FFT / 2 + 1];
+        for (int s = 0; s < SEGS; s++) {
+            const float* src = tdom + s * HOP;
+            for (int i = 0; i < WF_FFT; i++)
+                seg[i] = src[i] * window[i];
+            wf_fft_(fdom, seg);
+            for (int i = 0; i < WF_BINS; i++)
+                pwr[i] += std::norm(fdom[i]);
+        }
+
+        float db[WF_BINS];
+        for (int i = 0; i < WF_BINS; i++) {
+            float p3 = 2.0f * pwr[i] + pwr[i > 0 ? i - 1 : 0] +
+                       pwr[i < WF_BINS - 1 ? i + 1 : i];
+            db[i] = 10.0f * std::log10(p3 + 1e-12f);
+        }
+
+        float sorted[WF_BINS];
+        std::copy(db, db + WF_BINS, sorted);
+        std::nth_element(sorted, sorted + WF_BINS / 2, sorted + WF_BINS);
+        float med = sorted[WF_BINS / 2];
+        if (med < -105.0f)
+            return;
+        if (wf_rows_.empty())
+            wf_floor_db_ = med;
+        else if (med < wf_floor_db_)
+            wf_floor_db_ += (med - wf_floor_db_) * 0.5f;
+        else
+            wf_floor_db_ += (med - wf_floor_db_) * 0.02f;
+
+        std::array<uint8_t, WF_BINS> row;
+        for (int i = 0; i < WF_BINS; i++) {
+            float v = (db[i] - wf_floor_db_ + 6.0f) * (255.0f / 50.0f);
+            row[i] = (uint8_t)std::max(0.0f, std::min(255.0f, v));
+        }
+        wf_rows_.push_front(row);
+        if ((int)wf_rows_.size() > WF_MAX_ROWS)
+            wf_rows_.pop_back();
+    }
+
+    void draw_waterfall(int y, int x, int h, int w) {
+
+        // frequency axis
+
+        attron(A_DIM);
+        mvhline(y, x, ACS_HLINE, w);
+        for (int f = 0; f <= 3000; f += 500) {
+            int cx = x + (int)((int64_t)f * (w - 1) / 3000);
+            if (f % 1000) {
+                mvaddch(y, cx, '+');
+            } else if (f == 0) {
+                mvaddch(y, cx, '0');
+            } else {
+                char lbl[8];
+                snprintf(lbl, sizeof(lbl), "%dk", f / 1000);
+                if (cx + (int)strlen(lbl) > x + w)
+                    cx = x + w - (int)strlen(lbl);
+                mvaddstr(y, cx, lbl);
+            }
+        }
+        attroff(A_DIM);
+        int cf = state_.center_freq;
+        if (cf > 0 && cf <= 3000) {
+            attron(COLOR_PAIR(4) | A_BOLD);
+            mvaddch(y, x + (int)((int64_t)cf * (w - 1) / 3000), 'v');
+            attroff(COLOR_PAIR(4) | A_BOLD);
+        }
+
+        if (wf_rows_.empty()) {
+            attron(A_DIM);
+            mvaddstr(y + 1, x, "(waiting for audio)");
+            attroff(A_DIM);
+            return;
+        }
+
+        int nrows = std::min((int)wf_rows_.size(), h);
+        for (int r = 0; r < nrows; r++) {
+            const auto& row = wf_rows_[r];
+            move(y + 1 + r, x);
+            int cur = -1;
+            for (int col = 0; col < w; col++) {
+                int b0 = col * WF_BINS / w;
+                int b1 = std::max(b0 + 1, (col + 1) * WF_BINS / w);
+                int q = 0;
+                for (int b = b0; b < b1 && b < WF_BINS; b++)
+                    q = std::max(q, (int)row[b]);
+                if (wf_pairs_ > 0) {
+                    int attr = COLOR_PAIR(WF_PAIR_BASE + q * wf_pairs_ / 256);
+                    if (attr != cur) {
+                        if (cur != -1) attroff(cur);
+                        attron(attr);
+                        cur = attr;
+                    }
+                    addch(' ');
+                } else {
+                    static const char ramp[] = " .:-=+*xX";
+                    addch(ramp[q * 9 / 256]);
+                }
+            }
+            if (cur != -1) attroff(cur);
+        }
+    }
+
     void draw_scope(int y, int h, int cols) {
         int c1 = 3;
-        
+        int bottom = y + h;  // first row past the scope area
+
         attron(COLOR_PAIR(4) | A_BOLD);
         mvaddstr(y, c1, "[ CONSTELLATION ]");
         attroff(COLOR_PAIR(4) | A_BOLD);
@@ -4889,6 +5192,7 @@ private:
         // Terminal chars are ~2:1 aspect ratio (taller than wide)
         // For visually square display: width should be ~2x height
         int const_height = available_h;
+        if (const_height > 10) const_height = 10;  // leftover rows go to the waterfall
         int const_width = const_height * 2;  // 2:1 aspect ratio compensation
         
         // Clamp to available width
@@ -4963,6 +5267,15 @@ private:
         attron(COLOR_PAIR(2));
         printw(" %d", state_.tx_frame_count.load());
         attroff(COLOR_PAIR(2));
+
+        y += 2;
+        int wf_h = bottom - (y + 1);  // history rows under the axis line
+        if (wf_h < 3) {
+            state_.scope_active = false;  // too small; skip audio capture too
+            return;
+        }
+        update_waterfall();
+        draw_waterfall(y, c1, wf_h, cols - c1 - 3);
     }
     
     void draw_utils(int y, int h, int cols) {
@@ -5057,7 +5370,6 @@ private:
             "Send Ping",
             "Clear Stats",
             "Auto Threshold",
-            "Reconnect Audio",
             "Compose Message",
             "Auto Send",
             "Perf Log CSV",
@@ -5084,8 +5396,8 @@ private:
                 continue;
             }
             int i = utils_slot_action(slot);
-            const char* label = i >= 11 ? ALT_MODES[i - 11].label : actions[i];
-            const char* indent = i >= 11 ? "   " : "";
+            const char* label = i >= 10 ? ALT_MODES[i - 10].label : actions[i];
+            const char* indent = i >= 10 ? "   " : "";
             if (sel) {
                 attron(A_BOLD);
                 mvprintw(dy, c1, "> %d. %s%s", i + 1, indent, label);
@@ -5095,8 +5407,8 @@ private:
                 mvprintw(dy, c1, "  %d. %s%s", i + 1, indent, label);
                 attroff(A_DIM);
             }
-            if (i >= 11) {
-                bool on = (state_.alt_mode_mask >> (i - 11)) & 1;
+            if (i >= 10) {
+                bool on = (state_.alt_mode_mask >> (i - 10)) & 1;
                 if (on) {
                     attron(COLOR_PAIR(1) | A_BOLD);
                     printw("  [x]");
@@ -5104,7 +5416,7 @@ private:
                 } else {
                     printw("  [ ]");
                 }
-                if (auto_alt_enabled_ && alt_index_ == i - 11) {
+                if (auto_alt_enabled_ && alt_index_ == i - 10) {
                     attron(COLOR_PAIR(4) | A_BOLD);
                     printw("  <TX");
                     attroff(COLOR_PAIR(4) | A_BOLD);
@@ -5390,23 +5702,10 @@ private:
                 break;
             }
             case 5: {
-                state_.add_log("Reconnecting audio...");
-                if (state_.on_reconnect_audio) {
-                    if (state_.on_reconnect_audio()) {
-                        state_.audio_connected = true;
-                        state_.add_log("Audio reconnected OK");
-                    } else {
-                        state_.audio_connected = false;
-                        state_.add_log("Audio reconnect FAILED");
-                    }
-                }
-                break;
-            }
-            case 6: {
                 compose_message();
                 break;
             }
-            case 7: {
+            case 6: {
                 auto_send_enabled_ = !auto_send_enabled_;
                 if (auto_send_enabled_) {
                     auto_alt_enabled_ = false;
@@ -5419,7 +5718,7 @@ private:
                 }
                 break;
             }
-            case 8: {
+            case 7: {
                 if (state_.perf_logger) {
                     bool on = !state_.perf_logger->csv_enabled();
                     state_.perf_logger->set_csv_enabled(on);
@@ -5428,14 +5727,14 @@ private:
                 }
                 break;
             }
-            case 9: {
+            case 8: {
                 if (state_.perf_logger) {
                     state_.perf_logger->reset();
                     state_.add_log("Perf stats reset");
                 }
                 break;
             }
-            case 10: {
+            case 9: {
                 if (!auto_alt_enabled_ && state_.alt_mode_mask == 0) {
                     state_.add_log("Auto alternate: check some modes below first");
                     break;
@@ -5455,9 +5754,9 @@ private:
                 break;
             }
             default: {
-                if (action >= 11 &&
-                    action < 11 + ALT_MODE_COUNT) {
-                    int bit = action - 11;
+                if (action >= 10 &&
+                    action < 10 + ALT_MODE_COUNT) {
+                    int bit = action - 10;
                     state_.alt_mode_mask ^= 1 << bit;
                     state_.save_settings();
                 }
@@ -5507,7 +5806,7 @@ private:
         return out;
     }
 
-    static constexpr int UTILS_TOP_ACTIONS = 7;
+    static constexpr int UTILS_TOP_ACTIONS = 6;
     int utils_visible_slots() const {
         return state_.utils_testing_open ? UTILS_ACTION_COUNT + 1
                                          : UTILS_TOP_ACTIONS + 1;
@@ -5529,6 +5828,17 @@ private:
             utils_scroll_ = sel_row;
         else if (sel_row >= utils_scroll_ + vis)
             utils_scroll_ = sel_row - vis + 1;
+    }
+
+    void tick_level_history() {
+        if (!state_.on_get_audio_level) return;
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (last_level_ms_ != 0 && now - last_level_ms_ < LEVEL_SAMPLE_MS)
+            return;
+        last_level_ms_ = now;
+        float db = state_.on_get_audio_level();
+        state_.update_level(db, state_.dcd_active.load());
     }
 
     void tick_auto_send() {
@@ -6125,6 +6435,8 @@ private:
     bool initialized_ = false;
     std::atomic<bool> running_{false};
     int current_tab_ = 0;
+    static constexpr int LEVEL_SAMPLE_MS = 100;
+    int64_t last_level_ms_ = 0;
     int current_field_ = 0;
     int rx_off_dialog_field_ = -1;
 
@@ -6199,6 +6511,17 @@ private:
             rx_off_dialog_field_ = current_field_;
         }
     }
+    static constexpr int WF_FFT = 256;
+    static constexpr int WF_BINS = WF_FFT / 2;  
+    static constexpr int WF_MAX_ROWS = 64;
+    static constexpr int WF_ROW_MS = 100;
+    static constexpr int WF_PAIR_BASE = 20;
+    int wf_pairs_ = 0;
+    std::deque<std::array<uint8_t, WF_BINS>> wf_rows_;
+    int64_t wf_row_ms_ = 0;
+    uint32_t wf_seen_ = 0;
+    float wf_floor_db_ = -80.0f;
+    DSP::RealToHalfComplexTransform<WF_FFT, std::complex<float>> wf_fft_;
     int config_scroll_ = 0;
     int log_scroll_ = 0;
     int utils_selection_ = 0;

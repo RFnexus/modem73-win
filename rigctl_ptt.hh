@@ -3,6 +3,7 @@
 #include <string>
 #include <iostream>
 #include <cstring>
+#include <chrono>
 #include <mutex>
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -104,6 +105,12 @@ private:
     bool connect_locked() {
         if (connected_) return true;
 
+        int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (now - last_connect_ms_ < 3000)
+            return false;
+        last_connect_ms_ = now;
+
         sock_ = socket(AF_INET, SOCK_STREAM, 0);
         if (sock_ == INVALID_SOCKET) {
             std::cerr << "rigctl: Failed to create socket" << std::endl;
@@ -171,6 +178,7 @@ private:
     SOCKET sock_ = INVALID_SOCKET;
     bool connected_ = false;
     bool ptt_on_ = false;
+    int64_t last_connect_ms_ = 0;
     std::mutex mutex_;
 };
 
