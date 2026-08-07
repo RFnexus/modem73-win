@@ -105,7 +105,12 @@ public:
                 fclose(f);
             }
             if (std::string(first) != header) {
-                rename(path_.c_str(), (path_ + ".old").c_str());
+                {
+#ifdef _WIN32
+                    remove((path_ + ".old").c_str());
+#endif
+                    rename(path_.c_str(), (path_ + ".old").c_str());
+                }
                 fresh = true;
             }
         }

@@ -127,6 +127,15 @@ const std::vector<std::string> CODE_RATE_OPTIONS = {
     "1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"
 };
 
+// MSVCRT rename() fails when the destination exists, unlike POSIX; remove
+// the destination first on Windows so saves actually replace the old file.
+inline bool replace_file(const std::string& tmp, const std::string& dest) {
+#ifdef _WIN32
+    remove(dest.c_str());
+#endif
+    return rename(tmp.c_str(), dest.c_str()) == 0;
+}
+
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
     "NONE", "RIGCTL", "VOX", "COM"
 #ifdef WITH_CM108
@@ -789,7 +798,7 @@ struct TNCUIState {
         fprintf(f, "random_data_size=%d\n", random_data_size);
         fprintf(f, "utils_testing=%d\n", utils_testing_open ? 1 : 0);
 
-        if (fclose(f) != 0 || rename(tmp.c_str(), config_file.c_str()) != 0) {
+        if (fclose(f) != 0 || !replace_file(tmp, config_file)) {
             remove(tmp.c_str());
             return false;
         }
@@ -803,12 +812,12 @@ struct TNCUIState {
         FILE* f = fopen(config_file.c_str(), "r");
         if (!f) return false;
         
-        char line[256];
+        char line[512];
         while (fgets(line, sizeof(line), f)) {
             if (line[0] == '#') continue;
             
-            char key[64], value[192];
-            if (sscanf(line, "%63[^=]=%191[^\n]", key, value) == 2) {
+            char key[64], value[384];
+            if (sscanf(line, "%63[^=]=%383[^\n]", key, value) == 2) {
                 if (strcmp(key, "callsign") == 0) callsign = value;
                 else if (strcmp(key, "modem_type") == 0) {
                     int v = atoi(value);
@@ -950,7 +959,7 @@ struct TNCUIState {
                     p.postamble ? 1 : 0);
         }
 
-        if (fclose(f) != 0 || rename(tmp.c_str(), presets_file.c_str()) != 0) {
+        if (fclose(f) != 0 || !replace_file(tmp, presets_file)) {
             remove(tmp.c_str());
             return false;
         }
