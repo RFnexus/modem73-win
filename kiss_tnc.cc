@@ -30,6 +30,7 @@
 // Local includes
 #include "kiss_tnc.hh"
 #include "csma.hh"
+#include "tone_dcd.hh"
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
 #include "serial_ptt.hh"
@@ -49,6 +50,7 @@
 std::atomic<bool> g_running{true};
 TNCConfig g_config;
 bool g_verbose = false;
+bool g_debug = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -204,6 +206,7 @@ public:
         robust_encoder_ = std::make_unique<RobustEncoder>();
         robust_decoder_ = std::make_unique<RobustDecoder>(config.center_freq);
         robust_decoder_n_ = std::make_unique<RobustDecoder>(config.center_freq, true);
+        tone_dcd_ = std::make_unique<ToneDCD>(config.center_freq, config.sample_rate);
 
         std::cerr << "  All encoders/decoders created" << std::endl;
 
@@ -581,7 +584,12 @@ private:
         // Random number generator for CSMA
         std::random_device rd;
         std::mt19937 gen(rd());
-        
+        if (station_id_ == 0)
+            station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
+        int csma_stage = 0;
+        int csma_clean = 0;
+        int64_t last_burst_end = -1000000;
+
         while (tx_running_ && g_running) {
             TxPacket pkt;
             if (tx_queue_.pop(pkt)) {
@@ -591,14 +599,15 @@ private:
                 }
 #endif
                 // CSMA
-                bool csma_enabled, csma_sync_only;
-                int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst;
+                bool csma_enabled, csma_sync_only, csma_fast_floor;
+                int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst, modem_type;
                 float carrier_threshold_db;
                 std::string csma_callsign;
                 {
                     std::lock_guard<std::mutex> lock(config_mutex_);
                     csma_enabled = config_.csma_enabled;
                     csma_sync_only = config_.csma_sync_only;
+                    csma_fast_floor = config_.csma_fast_floor;
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
@@ -607,6 +616,7 @@ private:
                     csma_dither = config_.csma_responder_dither;
                     csma_burst = std::max(1, std::min(4, config_.csma_burst));
                     csma_callsign = config_.callsign;
+                    modem_type = config_.modem_type;
                     if (config_.modem_type == 0) {
                         bool short_ofdm = pkt.oper_mode >= 0
                             ? (pkt.oper_mode & 1) == 0
@@ -633,6 +643,29 @@ private:
                     gcfg.quiet_ms = csma_quiet_ms > 0 ? csma_quiet_ms : auto_quiet_ms();
                     gcfg.cw = csma_cw;
                     gcfg.slot_ms = slot_time_ms;
+                    gcfg.dcd_detect_ms = csma_fast_floor ? 550
+                                       : modem_type == 2 ? 780 : 1310;
+                    gcfg.contenders = csma_sync_only ? n_contenders() : -1;
+                    if (occupancy_pct_.load() > 55 || csma_stage >= 1 ||
+                        gcfg.contenders > 1)
+                        gcfg.contenders = -1;
+                    if (steady_now_ms() - last_burst_end < 3000 &&
+                        gcfg.contenders >= 0 && gcfg.contenders <= 1)
+                        gcfg.contenders = 2;
+                    if (gcfg.contenders >= 0)
+                        gcfg.dcd_detect_ms = 550;
+                    if (csma_sync_only && csma_quiet_ms <= 0 &&
+                        gcfg.contenders >= 0 && gcfg.contenders <= 1)
+                        gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
+                    if (g_debug && csma_sync_only) {
+                        char dbg[128];
+                        snprintf(dbg, sizeof dbg,
+                                 "CSMA: contenders %d stage %d occupancy %d%% "
+                                 "quiet %d ms",
+                                 gcfg.contenders, csma_stage,
+                                 occupancy_pct_.load(), gcfg.quiet_ms);
+                        ui_log(dbg);
+                    }
                     gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
                     int64_t idle_since = steady_now_ms() - last_channel_busy_ms_.load();
                     gcfg.idle_credit_ms = (int)std::max<int64_t>(0,
@@ -647,9 +680,12 @@ private:
                     }
                     int64_t rx_ms = last_rx_done_ms_.load();
                     gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
-                                     pkt.enqueue_ms - rx_ms <= 2000 &&
-                                     steady_now_ms() - rx_ms <= 5000;
+                                     pkt.enqueue_ms - rx_ms <= 5000 &&
+                                     steady_now_ms() - rx_ms <= 8000;
                     CsmaGate gate(gcfg, (uint32_t)gen());
+#ifdef WITH_UI
+                    if (g_ui_state) g_ui_state->csma_window_ms = gate.window_ms();
+#endif
 
                     if (gcfg.responder) {
                         std::cerr << "CSMA: responder priority, quiet "
@@ -661,6 +697,7 @@ private:
                     }
 
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
+                    int busy_episodes = 0;
                     while (g_running) {
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
@@ -691,6 +728,7 @@ private:
                         bool busy = alive && (!allowed ||
                             (!csma_sync_only && level_db > carrier_threshold_db));
                         if (busy && !was_busy) {
+                            busy_episodes++;
                             if (!allowed) {
                                 std::cerr << "CSMA: receiving, deferring" << std::endl;
                             } else {
@@ -723,6 +761,15 @@ private:
 #endif
                         std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
                     }
+                    if (csma_sync_only) {
+                        if (busy_episodes >= 2) {
+                            csma_stage = std::min(csma_stage + 2, 2);
+                            csma_clean = 0;
+                        } else if (busy_episodes <= 1 && ++csma_clean >= 3) {
+                            csma_clean = 0;
+                            csma_stage = std::max(csma_stage - 1, 0);
+                        }
+                    }
                     if (!g_running)
                         break;
                 }
@@ -742,8 +789,10 @@ private:
                     }
 #endif
                     bool sent = transmit(cur.data, cur.oper_mode, first, !have_next);
-                    if (!have_next)
+                    if (!have_next) {
+                        last_burst_end = steady_now_ms();
                         break;
+                    }
                     std::cerr << "CSMA: burst continuation ("
                               << remaining << " left)" << std::endl;
                     cur = std::move(next);
@@ -806,6 +855,7 @@ private:
                   bool first = true, bool last = true) {
         while (alc_tune_active_.load() && g_running)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        tx_on_air_ = true;
         int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
         if (oper_mode_override >= 0) {
@@ -969,9 +1019,13 @@ private:
                 // Leading silence (TXDelay)
                 int lead_frames = config_.tx_delay_ms * config_.sample_rate / 1000;
                 if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
+                    int lead_ms = std::max(config_.tx_delay_ms, 500);
+                    lead_frames = lead_ms * config_.sample_rate / 1000;
                     int gap_frames = 150 * config_.sample_rate / 1000;
-                    auto lead = generate_tone(modem_config_.center_freq,
-                                              lead_frames - gap_frames, 0.6f);
+                    auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
+                                                        lead_frames - gap_frames, 0.6f,
+                                                        config_.sample_rate,
+                                                        station_id_);
                     for (size_t i = 0; i < lead.size(); i += 1024) {
                         int n = std::min(1024, (int)(lead.size() - i));
                         audio_->write(lead.data() + i, n);
@@ -1007,7 +1061,9 @@ private:
                 }
             }
         }
-        
+        if (last)
+            tx_on_air_ = false;
+
         if (last) {
             tx_blanking_active_ = false;
         }
@@ -1272,6 +1328,7 @@ private:
             mfsk_callbacks[i] = make_mfsk_callback(mfsk_decoders_[i].get());
 
         bool was_blanking = false;
+        bool was_on_air = false;
 
         while (rx_running_ && g_running) {
             int n = audio_->read(buffer.data(), buffer.size());
@@ -1306,6 +1363,11 @@ private:
                             float x = ((loud && !config_.csma_sync_only) ||
                                        blanking || dcd_active_) ? 1.0f : 0.0f;
                             occupancy_ema_ += (x - occupancy_ema_) * a;
+                            float xo = ((loud && !config_.csma_sync_only) ||
+                                        dcd_active_) ? 1.0f : 0.0f;
+                            occupancy_other_ema_ += (xo - occupancy_other_ema_) * a;
+                            occupancy_pct_.store(
+                                (int)(occupancy_other_ema_ * 100.0f));
                         }
                     }
                     occ_last_ms_ = now_ms;
@@ -1334,12 +1396,16 @@ private:
                             mfsk_decoders_[i]->configure(MFSK_RX_MODES[i], cf);
                         robust_decoder_->configure(cf);
                         robust_decoder_n_->configure(cf);
+                        tone_dcd_->configure(cf);
                     }
                     if (was_blanking) {
                         decoder_->reset();
                         for (auto& d : mfsk_decoders_) d->reset();
                         robust_decoder_->reset();
                         robust_decoder_n_->reset();
+                        tone_dcd_->reset();
+                        tone_hold_until_ms_ = 0;
+                        tone_run_start_ms_ = -1;
                         was_blanking = false;
                     }
                     bool mfsk_rx = config_.mfsk_rx_enabled || config_.modem_type == 1;
@@ -1355,14 +1421,81 @@ private:
                         robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
                     }
 
+                    bool on_air = tx_on_air_.load();
+                    if (!on_air) {
+                        if (was_on_air)
+                            tone_dcd_->reset();
+                        tone_dcd_->process(buffer.data(), n);
+                    }
+                    was_on_air = on_air;
+                    int64_t tnow = steady_now_ms();
+                    uint16_t heard_id;
+                    if (tone_dcd_->consume_station_id(&heard_id)) {
+                        size_t pop;
+                        {
+                            std::lock_guard<std::mutex> hl(heard_mutex_);
+                            heard_ids_[heard_id] = tnow;
+                            last_id_ms_ = tnow;
+                            pop = heard_ids_.size();
+                        }
+                        if (g_debug) {
+                            char dbg[96];
+                            snprintf(dbg, sizeof dbg,
+                                     "TONE: station %04X heard, population %zu",
+                                     heard_id, pop);
+                            ui_log(dbg);
+                        }
+                    }
+                    if (tone_dcd_->consume_id_failure()) {
+                        last_unattrib_ms_.store(tnow);
+                        if (g_debug)
+                            ui_log("TONE: signature ID unreadable, "
+                                   "population unknown for 90s");
+                    }
+                    if (tone_dcd_->consume_signature()) {
+                        if (tnow >= tone_hold_until_ms_)
+                            ui_log("CSMA: TX signature heard, deferring");
+                        tone_hold_until_ms_ = tnow + 1500;
+#ifdef WITH_UI
+                        if (g_ui_state) g_ui_state->wf_sig_ms = tnow;
+#endif
+                    } else if (tone_dcd_->tone_run_active()) {
+                        if (tone_run_start_ms_ < 0)
+                            tone_run_start_ms_ = tnow;
+                        if (tnow - tone_run_start_ms_ <= 2500)
+                            tone_hold_until_ms_ =
+                                std::max(tone_hold_until_ms_, tnow + 400);
+                    } else {
+                        tone_run_start_ms_ = -1;
+                    }
+
                     // sync DCD: OFDM meta-validated in_frame and pilot-confirmed
                     // RDM collects only; MFSK syncs are too loose to gate TX on
                     dcd_active_ = (ofdm_rx && decoder_->in_frame()) ||
                                   (robust_rx &&
                                    (robust_decoder_->carrier_active() ||
-                                    robust_decoder_n_->carrier_active()));
-                    if (dcd_active_)
+                                    robust_decoder_n_->carrier_active())) ||
+                                  (config_.csma_sync_only &&
+                                   tnow < tone_hold_until_ms_);
+                    if (dcd_active_) {
+                        if (tnow - last_dcd_ms_ > 1500 &&
+                            tnow - last_id_ms_ > 2500 &&
+                            pending_unattrib_ms_ < 0)
+                            pending_unattrib_ms_ = tnow;
+                        last_dcd_ms_ = tnow;
                         set_tx_lockout(RX_LOCKOUT_SECONDS);
+                    }
+                    if (pending_unattrib_ms_ >= 0) {
+                        if (tnow - last_id_ms_ < 2500) {
+                            pending_unattrib_ms_ = -1;
+                        } else if (tnow - pending_unattrib_ms_ > 1200) {
+                            pending_unattrib_ms_ = -1;
+                            last_unattrib_ms_.store(tnow);
+                            if (g_debug)
+                                ui_log("TONE: carrier without station ID, "
+                                       "population unknown for 90s");
+                        }
+                    }
                 }
 
 #ifdef WITH_UI
@@ -1624,7 +1757,33 @@ private:
     std::atomic<int64_t> heard_air_at_ms_{0};
     int64_t spell_start_ms_ = -1;
     int64_t spell_last_ms_ = 0;
+    std::unique_ptr<ToneDCD> tone_dcd_;
+    int64_t tone_hold_until_ms_ = 0;
+    int64_t tone_run_start_ms_ = -1;
+    uint16_t station_id_ = 0;
+    std::mutex heard_mutex_;
+    std::map<uint16_t, int64_t> heard_ids_;
+    int64_t last_id_ms_ = -1000000;
+    int64_t last_dcd_ms_ = -1000000;
+    int64_t pending_unattrib_ms_ = -1;
+    std::atomic<int64_t> last_unattrib_ms_{-1000000};
+
+    int n_contenders() {
+        int64_t now = steady_now_ms();
+        if (now - last_unattrib_ms_.load() <= 90000)
+            return -1;
+        std::lock_guard<std::mutex> hl(heard_mutex_);
+        for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
+            if (now - it->second > 90000)
+                it = heard_ids_.erase(it);
+            else
+                ++it;
+        }
+        return (int)heard_ids_.size();
+    }
     float occupancy_ema_ = 0.0f;
+    float occupancy_other_ema_ = 0.0f;
+    std::atomic<int> occupancy_pct_{0};
     int64_t occ_last_ms_ = 0;
     bool dcd_active_ = false;
     std::atomic<bool> alc_tune_active_{false};
@@ -1640,6 +1799,7 @@ private:
 
     // TX blanking
     std::atomic<bool> tx_blanking_active_{false};
+    std::atomic<bool> tx_on_air_{false};
     
 public:
     float alc_auto_tune() {
@@ -1737,6 +1897,7 @@ public:
         {
             config_.csma_enabled = new_config.csma_enabled;
             config_.csma_sync_only = new_config.csma_sync_only;
+            config_.csma_fast_floor = new_config.csma_fast_floor;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
@@ -2078,6 +2239,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "robust_rx_enabled") && take(key)) config.robust_rx_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_enabled") && take(key)) config.csma_enabled = atoi(value) != 0;
         else if (!strcmp(key, "csma_sync_only") && take(key)) config.csma_sync_only = atoi(value) != 0;
+        else if (!strcmp(key, "csma_fast_floor") && take(key)) config.csma_fast_floor = atoi(value) != 0;
         else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
         else if (!strcmp(key, "csma_quiet_ms") && take(key)) config.csma_quiet_ms = atoi(value);
@@ -2184,6 +2346,7 @@ void print_help(const char* prog) {
               << "  -h, --headless          Run without TUI\n"
 #endif
               << "  -v, --verbose           Verbose output\n"
+              << "      --debug             Log heard station IDs and population tracking\n"
               << "  --config [FILE]         Load options from FILE\n"
               << "                          (defaults to %APPDATA%\\modem73\\settings)\n"
               << "  --help                  Show this help\n"
@@ -2243,6 +2406,8 @@ int main(int argc, char** argv) {
 #endif
         } else if (arg == "-v" || arg == "--verbose") {
             g_verbose = true;
+        } else if (arg == "--debug") {
+            g_debug = true;
         } else if (arg == "-h" || arg == "--headless") {
 #ifdef WITH_UI
             g_use_ui = false;
@@ -2523,6 +2688,7 @@ int main(int argc, char** argv) {
                 if (!cli_set.count("csma_enabled"))
                     config.csma_enabled = ui_state.csma_enabled;
                 config.csma_sync_only = ui_state.csma_sync_only;
+                config.csma_fast_floor = ui_state.csma_fast_floor;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -2639,6 +2805,7 @@ int main(int argc, char** argv) {
                 ui_state.center_freq = config.center_freq;
                 ui_state.csma_enabled = config.csma_enabled;
                 ui_state.csma_sync_only = config.csma_sync_only;
+                ui_state.csma_fast_floor = config.csma_fast_floor;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2706,6 +2873,7 @@ int main(int argc, char** argv) {
         ui_state.postamble = config.postamble;
         ui_state.csma_enabled = config.csma_enabled;
         ui_state.csma_sync_only = config.csma_sync_only;
+        ui_state.csma_fast_floor = config.csma_fast_floor;
         ui_state.carrier_threshold_db = config.carrier_threshold_db;
         ui_state.slot_time_ms = config.slot_time_ms;
         ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2923,6 +3091,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "payload_size", tnc.get_payload_size());
                 cJSON_AddBoolToObject(j, "csma_enabled", cfg.csma_enabled);
                 cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
+                cJSON_AddBoolToObject(j, "csma_fast_floor", cfg.csma_fast_floor);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
@@ -2978,6 +3147,8 @@ int main(int argc, char** argv) {
                     new_config.csma_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_sync_only")) && cJSON_IsBool(item))
                     new_config.csma_sync_only = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_fast_floor")) && cJSON_IsBool(item))
+                    new_config.csma_fast_floor = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
                     new_config.carrier_threshold_db = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
@@ -3084,6 +3255,7 @@ int main(int argc, char** argv) {
                 new_config.postamble = state.postamble;
                 new_config.csma_enabled = state.csma_enabled;
                 new_config.csma_sync_only = state.csma_sync_only;
+                new_config.csma_fast_floor = state.csma_fast_floor;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;
