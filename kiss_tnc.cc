@@ -2552,7 +2552,8 @@ int main(int argc, char** argv) {
                 bool devices_migrated = false;
                 if (!ui_state.audio_input_device.empty() &&
                     ui_state.audio_input_device.find_first_not_of("0123456789") == std::string::npos) {
-                    size_t legacy_idx = std::stoul(ui_state.audio_input_device) + 1;
+                    size_t legacy_idx = ui_state.audio_input_device.size() < 6
+                        ? std::stoul(ui_state.audio_input_device) + 1 : (size_t)-1;
                     if (legacy_idx < ui_state.available_input_devices.size()) {
                         ui_state.audio_input_device = ui_state.available_input_devices[legacy_idx];
                         devices_migrated = true;
@@ -2560,7 +2561,8 @@ int main(int argc, char** argv) {
                 }
                 if (!ui_state.audio_output_device.empty() &&
                     ui_state.audio_output_device.find_first_not_of("0123456789") == std::string::npos) {
-                    size_t legacy_idx = std::stoul(ui_state.audio_output_device) + 1;
+                    size_t legacy_idx = ui_state.audio_output_device.size() < 6
+                        ? std::stoul(ui_state.audio_output_device) + 1 : (size_t)-1;
                     if (legacy_idx < ui_state.available_output_devices.size()) {
                         ui_state.audio_output_device = ui_state.available_output_devices[legacy_idx];
                         devices_migrated = true;
