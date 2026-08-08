@@ -1453,6 +1453,7 @@ private:
                         }
                     }
                     if (tone_dcd_->consume_id_failure()) {
+                        pending_unattrib_ms_ = -1;
                         if (g_debug)
                             ui_log("TONE: signature ID unreadable, "
                                    "population unchanged");
