@@ -1331,7 +1331,7 @@ public:
         nodelay(stdscr, TRUE);
         curs_set(0);
         
-        mousemask(ALL_MOUSE_EVENTS | REPORT_MOUSE_POSITION, NULL);
+        mousemask(ALL_MOUSE_EVENTS, NULL);
         mouseinterval(0);
         
         if (has_colors()) {
@@ -1374,7 +1374,15 @@ public:
                 continue;
             }
             if (ch != ERR) {
-                handle_input(ch);
+                int drained = 0;
+                while (ch != ERR && drained++ < 64) {
+                    handle_input(ch);
+                    ch = getch();
+                    if (ch == KEY_RESIZE) {
+                        handle_resize(ch);
+                        ch = ERR;
+                    }
+                }
             } else if (poll_resize()) {
                 continue;
             }
