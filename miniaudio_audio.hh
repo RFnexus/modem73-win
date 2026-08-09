@@ -157,7 +157,8 @@ public:
         auto start = std::chrono::steady_clock::now();
 
         while (frames_read < frames) {
-            if (!capture_open_.load(std::memory_order_acquire)) break;
+            if (!capture_open_.load(std::memory_order_acquire) ||
+                capture_stopped_.load(std::memory_order_acquire)) break;
             size_t read_pos = capture_read_pos_.load();
             size_t write_pos = capture_write_pos_.load();
             size_t available = (write_pos - read_pos + CAPTURE_RING_SIZE) % CAPTURE_RING_SIZE;
@@ -193,7 +194,8 @@ public:
         auto start = std::chrono::steady_clock::now();
 
         while (frames_written < frames) {
-            if (!playback_open_.load(std::memory_order_acquire)) break;
+            if (!playback_open_.load(std::memory_order_acquire) ||
+                playback_stopped_.load(std::memory_order_acquire)) break;
             size_t read_pos = playback_read_pos_.load();
             size_t write_pos = playback_write_pos_.load();
             size_t used = (write_pos - read_pos + RING_BUFFER_SIZE) % RING_BUFFER_SIZE;
@@ -227,6 +229,8 @@ public:
     bool is_healthy() const {
         return capture_open_.load(std::memory_order_acquire) &&
                playback_open_.load(std::memory_order_acquire) &&
+               !capture_stopped_.load(std::memory_order_acquire) &&
+               !playback_stopped_.load(std::memory_order_acquire) &&
                consecutive_read_failures_.load() < 3 &&
                consecutive_write_failures_.load() < 3;
     }
@@ -384,17 +388,18 @@ private:
         config.playback.channels = 1;
         config.sampleRate = sample_rate_;
         config.dataCallback = playback_callback;
+        config.notificationCallback = notification_callback;
         config.pUserData = this;
         config.periodSizeInFrames = 480;
         config.periods = 4;
 
         if (playback_device_id_ != "default" && !playback_device_id_.empty()) {
-            if (find_device_id(false, playback_device_id_, &stored_playback_id_)) {
-                config.playback.pDeviceID = &stored_playback_id_;
-            } else {
+            if (!find_device_id(false, playback_device_id_, &stored_playback_id_)) {
                 log_msg("(!) Playback device '" + playback_device_id_ +
-                        "' not found, using system default");
+                        "' not found - reconnect it or reselect in CONFIG");
+                return false;
             }
+            config.playback.pDeviceID = &stored_playback_id_;
         }
 
         if (ma_device_init(&context_, &config, &playback_device_) != MA_SUCCESS) {
@@ -408,6 +413,7 @@ private:
             return false;
         }
 
+        playback_stopped_.store(false, std::memory_order_release);
         playback_open_.store(true, std::memory_order_release);
         log_msg(std::string("Playback: ") + playback_device_.playback.name);
         return true;
@@ -422,17 +428,18 @@ private:
         config.capture.channels = 1;
         config.sampleRate = sample_rate_;
         config.dataCallback = capture_callback;
+        config.notificationCallback = notification_callback;
         config.pUserData = this;
         config.periodSizeInFrames = 480;
         config.periods = 4;
 
         if (capture_device_id_ != "default" && !capture_device_id_.empty()) {
-            if (find_device_id(true, capture_device_id_, &stored_capture_id_)) {
-                config.capture.pDeviceID = &stored_capture_id_;
-            } else {
+            if (!find_device_id(true, capture_device_id_, &stored_capture_id_)) {
                 log_msg("(!) Capture device '" + capture_device_id_ +
-                        "' not found, using system default");
+                        "' not found - reconnect it or reselect in CONFIG");
+                return false;
             }
+            config.capture.pDeviceID = &stored_capture_id_;
         }
 
         if (ma_device_init(&context_, &config, &capture_device_) != MA_SUCCESS) {
@@ -446,6 +453,7 @@ private:
             return false;
         }
 
+        capture_stopped_.store(false, std::memory_order_release);
         capture_open_.store(true, std::memory_order_release);
         log_msg(std::string("Capture: ") + capture_device_.capture.name);
         return true;
@@ -459,6 +467,7 @@ private:
         }
         playback_read_pos_ = 0;
         playback_write_pos_ = 0;
+        playback_stopped_.store(false, std::memory_order_release);
     }
 
     void close_capture_locked() {
@@ -469,6 +478,22 @@ private:
         }
         capture_read_pos_ = 0;
         capture_write_pos_ = 0;
+        capture_stopped_.store(false, std::memory_order_release);
+    }
+
+    static void notification_callback(const ma_device_notification* notification) {
+        if (notification->type != ma_device_notification_type_stopped)
+            return;
+        MiniAudio* self = static_cast<MiniAudio*>(notification->pDevice->pUserData);
+        if (notification->pDevice == &self->capture_device_) {
+            if (self->capture_open_.load(std::memory_order_acquire) &&
+                !self->capture_stopped_.exchange(true, std::memory_order_acq_rel))
+                self->log_msg("(!) Capture device stopped");
+        } else if (notification->pDevice == &self->playback_device_) {
+            if (self->playback_open_.load(std::memory_order_acquire) &&
+                !self->playback_stopped_.exchange(true, std::memory_order_acq_rel))
+                self->log_msg("(!) Playback device stopped");
+        }
     }
 
     static void playback_callback(ma_device* device, void* output, const void* input, ma_uint32 frame_count) {
@@ -548,6 +573,8 @@ private:
     std::atomic<bool> playback_open_{false};
     std::atomic<float> tx_gain_{1.0f};
     std::atomic<bool> capture_open_{false};
+    std::atomic<bool> playback_stopped_{false};
+    std::atomic<bool> capture_stopped_{false};
 
     std::mutex lifecycle_mutex_;
     std::shared_mutex capture_rw_;

@@ -1328,7 +1328,7 @@ public:
         cbreak();
         noecho();
         keypad(stdscr, TRUE);
-        nodelay(stdscr, TRUE);
+        timeout(0);
         curs_set(0);
         
         mousemask(ALL_MOUSE_EVENTS, NULL);
@@ -2017,7 +2017,7 @@ private:
             }
         }
 
-        nodelay(stdscr, TRUE);
+        timeout(0);
         curs_set(0);
         return accepted;
     }
@@ -2595,7 +2595,7 @@ private:
             }
         }
 
-        nodelay(stdscr, TRUE);
+        timeout(0);
     }
 
     void show_com_port_dialog() {
@@ -2754,7 +2754,7 @@ private:
             }
         }
 
-        nodelay(stdscr, TRUE);
+        timeout(0);
 
         if (manual) {
             clear();
@@ -2902,7 +2902,7 @@ private:
             }
         }
         
-        nodelay(stdscr, TRUE);
+        timeout(0);
     }
 
 #ifdef WITH_CM108
@@ -3061,7 +3061,7 @@ private:
             }
         }
 
-        nodelay(stdscr, TRUE);
+        timeout(0);
     }
 #endif
 
