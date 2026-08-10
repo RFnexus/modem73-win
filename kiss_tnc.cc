@@ -48,6 +48,7 @@
 #endif
 
 std::atomic<bool> g_running{true};
+std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
@@ -260,7 +261,7 @@ public:
                                              config_.sample_rate);
         audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
         if (!audio_->open_playback()) {
-            throw std::runtime_error("Failed to open audio input");
+            throw std::runtime_error("Failed to open audio output");
         }
         if (!audio_->open_capture()) {
             throw std::runtime_error("Failed to open audio capture");
@@ -589,11 +590,12 @@ private:
         int csma_stage = 0;
         int csma_clean = 0;
         int boot_attempt = 0;
-        int64_t last_burst_end = -1000000;
+        int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_due = [&]() {
             return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
         };
         int64_t last_id_air_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
+        int64_t beacon_anchor_ms = last_id_air_ms;
         int64_t beacon_due_ms = beacon_due();
         int64_t tx_start_ms = steady_now_ms();
 
@@ -613,7 +615,7 @@ private:
                                      config_.csma_ranked;
                     }
                     if (!still_want || !tx_queue_.empty() || !is_tx_allowed()) {
-                        last_id_air_ms = steady_now_ms();
+                        beacon_anchor_ms = steady_now_ms();
                         beacon_due_ms = beacon_due();
                         continue;
                     }
@@ -644,7 +646,7 @@ private:
                     if (config_.modem_type == 0) {
                         bool short_ofdm = pkt.oper_mode >= 0
                             ? (pkt.oper_mode & 1) == 0
-                            : config_.frame_size == 0;
+                            : (config_.frame_size == 0 || config_.frame_size == 3);
                         if (short_ofdm) {
                             slot_time_ms = std::min(slot_time_ms, 300);
                             csma_burst = 4;
@@ -696,15 +698,19 @@ private:
                         if (gcfg.rank >= gcfg.rank_n)
                             yield_attempt_++;
                         if (gcfg.rank < 0) {
-                            boot_rank = (int)(id_mix(station_id_.load(),
-                                                     boot_attempt) % 4);
-                            boot_attempt++;
-                            int known = known_others() + 1;
-                            gcfg.rank = std::max(4, known) + boot_rank;
-                            gcfg.rank_n = gcfg.rank + 1;
-                            if (g_debug && forgotten)
-                                ui_log("CSMA: silent too long, entering after "
-                                       "known turns");
+                            int known = known_others();
+                            if (known > 0) {
+                                boot_rank = (int)(id_mix(station_id_.load(),
+                                                         boot_attempt) % 4);
+                                boot_attempt++;
+                                gcfg.rank = std::max(4, known + 1) + boot_rank;
+                                gcfg.rank_n = gcfg.rank + 1;
+                                if (g_debug && forgotten)
+                                    ui_log("CSMA: silent too long, entering "
+                                           "after known turns");
+                            } else {
+                                gcfg.rank_n = 0;
+                            }
                         } else {
                             boot_attempt = 0;
                         }
@@ -762,7 +768,12 @@ private:
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
                     int busy_episodes = 0;
                     int cur_rank = -1, cur_rank_n = 0;
+                    bool beacon_yield = false;
                     while (g_running) {
+                        if (pkt.beacon && !tx_queue_.empty()) {
+                            beacon_yield = true;
+                            break;
+                        }
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
                         bool allowed = is_tx_allowed();
@@ -835,6 +846,14 @@ private:
 #endif
                         std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
                     }
+                    if (beacon_yield) {
+#ifdef WITH_UI
+                        if (g_ui_state) g_ui_state->csma_phase = 0;
+#endif
+                        beacon_anchor_ms = steady_now_ms();
+                        beacon_due_ms = beacon_due();
+                        continue;
+                    }
                     if (csma_sync_only) {
                         if (busy_episodes >= 2) {
                             csma_stage = std::min(csma_stage + 2, 2);
@@ -869,6 +888,7 @@ private:
                             last_burst_end = steady_now_ms();
                         if (sent) {
                             last_id_air_ms = steady_now_ms();
+                            beacon_anchor_ms = last_id_air_ms;
                             beacon_due_ms = beacon_due();
                             if (csma_ranked)
                                 last_winner_id_.store(station_id_.load());
@@ -884,7 +904,7 @@ private:
                 }
             } else {
                 int64_t bnow = steady_now_ms();
-                if (bnow - last_id_air_ms >= beacon_due_ms) {
+                if (bnow - beacon_anchor_ms >= beacon_due_ms) {
                     bool want;
                     {
                         std::lock_guard<std::mutex> lock(config_mutex_);
@@ -902,7 +922,7 @@ private:
                         b.beacon = true;
                         tx_queue_.push(std::move(b));
                     } else {
-                        last_id_air_ms = bnow;
+                        beacon_anchor_ms = bnow;
                         beacon_due_ms = beacon_due();
                     }
                 }
@@ -2295,6 +2315,12 @@ public:
 
     bool is_transmitting() const { return tx_blanking_active_.load(); }
 
+    void unkey() {
+        set_ptt(false);
+        tx_on_air_ = false;
+        tx_blanking_active_ = false;
+    }
+
     size_t tx_queue_depth() const { return tx_queue_.size(); }
 
     int channel_population() { return known_others(); }
@@ -2431,7 +2457,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "short_frame") && take("frame_size")) config.frame_size = atoi(value) != 0 ? 0 : 1;
         else if (!strcmp(key, "frame_size") && take(key)) {
             int v = atoi(value);
-            if (v >= 0 && v <= 2) config.frame_size = v;
+            if (v >= 0 && v <= 3) config.frame_size = v;
         }
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = 1500;
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
@@ -2444,7 +2470,11 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "csma_fast_floor") && take(key)) config.csma_fast_floor = atoi(value) != 0;
         else if (!strcmp(key, "csma_ranked") && take(key)) config.csma_ranked = atoi(value) != 0;
         else if (!strcmp(key, "csma_band") && take(key)) config.csma_band = atoi(value) != 0 ? 1 : 0;
-        else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
+        else if (!strcmp(key, "carrier_threshold_db") && take(key)) {
+            float v = atof(value);
+            if (std::isfinite(v) && v >= -80.0f && v <= 0.0f)
+                config.carrier_threshold_db = v;
+        }
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
         else if (!strcmp(key, "csma_quiet_ms") && take(key)) config.csma_quiet_ms = atoi(value);
         else if (!strcmp(key, "csma_cw") && take(key)) config.csma_cw = atoi(value);
@@ -2461,18 +2491,33 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (take("audio_output")) config.audio_output_device = value;
         }
         else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(atoi(value));
-        else if (!strcmp(key, "vox_tone_freq") && take(key)) config.vox_tone_freq = atoi(value);
-        else if (!strcmp(key, "vox_lead_ms") && take(key)) config.vox_lead_ms = atoi(value);
-        else if (!strcmp(key, "vox_tail_ms") && take(key)) config.vox_tail_ms = atoi(value);
+        else if (!strcmp(key, "vox_tone_freq") && take(key)) {
+            int v = atoi(value);
+            if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
+        }
+        else if (!strcmp(key, "vox_lead_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) config.vox_lead_ms = v;
+        }
+        else if (!strcmp(key, "vox_tail_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) config.vox_tail_ms = v;
+        }
         else if (!strcmp(key, "com_port") && take(key)) config.com_port = value;
-        else if (!strcmp(key, "com_ptt_line") && take(key)) config.com_ptt_line = atoi(value);
+        else if (!strcmp(key, "com_ptt_line") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 2) config.com_ptt_line = v;
+        }
         else if (!strcmp(key, "com_invert_dtr") && take(key)) config.com_invert_dtr = atoi(value) != 0;
         else if (!strcmp(key, "com_invert_rts") && take(key)) config.com_invert_rts = atoi(value) != 0;
 #ifdef WITH_CM108
         else if (!strcmp(key, "cm108_gpio") && take(key)) config.cm108_gpio = atoi(value);
         else if (!strcmp(key, "cm108_device") && take(key)) config.cm108_device = value;
 #endif
-        else if (!strcmp(key, "port") && take(key)) config.port = atoi(value);
+        else if (!strcmp(key, "port") && take(key)) {
+            int v = atoi(value);
+            if (v >= 1 && v <= 65535) config.port = v;
+        }
         else if (!strcmp(key, "bind_address") && take(key)) config.bind_address = value;
         else if (!strcmp(key, "control_bind_address") && take(key)) config.control_bind_address = value;
     }
@@ -2499,6 +2544,7 @@ void print_help(const char* prog) {
               << "  --short                 Use short frames\n"
               << "  --normal                Use normal frames (default)\n"
               << "  --long                  Use long frames\n"
+              << "  --micro                 QB micro burst (QPSK 1/2 only, 32 B in ~0.59 s)\n"
               << "  --no-rxfilter           Disable RX bandpass in front of the OFDM decoder\n"
               << "\nPTT options:\n"
               << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
@@ -2617,7 +2663,7 @@ int main(int argc, char** argv) {
             g_use_ui = false;
 #endif
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            config.port = std::atoi(argv[++i]);
+            config.port = std::min(65535, std::max(1, std::atoi(argv[++i])));
             cli_set.insert("port");
         } else if (arg == "--bind" && i + 1 < argc) {
             config.bind_address = argv[++i];
@@ -2669,6 +2715,9 @@ int main(int argc, char** argv) {
             cli_set.insert("frame_size");
         } else if (arg == "--normal") {
             config.frame_size = 1;
+            cli_set.insert("frame_size");
+        } else if (arg == "--micro") {
+            config.frame_size = 3;
             cli_set.insert("frame_size");
         } else if (arg == "--long") {
             config.frame_size = 2;
@@ -2743,13 +2792,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else if (arg == "--vox-freq" && i + 1 < argc) {
-            config.vox_tone_freq = std::atoi(argv[++i]);
+            config.vox_tone_freq = std::min(3000, std::max(300, std::atoi(argv[++i])));
             cli_set.insert("vox_tone_freq");
         } else if (arg == "--vox-lead" && i + 1 < argc) {
-            config.vox_lead_ms = std::atoi(argv[++i]);
+            config.vox_lead_ms = std::min(2000, std::max(50, std::atoi(argv[++i])));
             cli_set.insert("vox_lead_ms");
         } else if (arg == "--vox-tail" && i + 1 < argc) {
-            config.vox_tail_ms = std::atoi(argv[++i]);
+            config.vox_tail_ms = std::min(2000, std::max(50, std::atoi(argv[++i])));
             cli_set.insert("vox_tail_ms");
 #ifdef WITH_CM108
         } else if (arg == "--cm108-gpio" && i + 1 < argc) {
@@ -3537,7 +3586,14 @@ int main(int argc, char** argv) {
 
             // Run TNC in background thread
             std::thread tnc_thread([&tnc]() {
-                tnc.run();
+                try {
+                    tnc.run();
+                } catch (const std::exception& e) {
+                    tnc.unkey();
+                    ui_log(std::string("FATAL: ") + e.what());
+                    g_fatal_error = e.what();
+                    g_running = false;
+                }
             });
             
             // Status update thread 
@@ -3572,6 +3628,11 @@ int main(int argc, char** argv) {
         if (ctrl) ctrl->stop();
     } catch (const std::exception& e) {
         std::cerr << "error " << e.what() << std::endl;
+        return 1;
+    }
+
+    if (!g_fatal_error.empty()) {
+        std::cerr << "error " << g_fatal_error << std::endl;
         return 1;
     }
     
