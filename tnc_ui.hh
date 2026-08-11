@@ -26,6 +26,7 @@ extern "C" int PDC_get_columns(void);
 #include <iomanip>
 #include <cstring>
 #include <cctype>
+#include "config_token.hh"
 #include <cmath>
 #include <complex>
 #include <array>
@@ -45,6 +46,7 @@ extern "C" int PDC_get_columns(void);
 #endif
 
 constexpr size_t MAX_LOG_ENTRIES = 500;
+constexpr int RANKED_QUIET_DISPLAY_MS = 1000;
 
 const std::vector<std::string> MODEM_TYPE_OPTIONS = {"OFDM", "MFSK", "ROBUST"};
 const std::vector<std::string> ROBUST_MODE_OPTIONS = {"RDM-1200", "RDM-800", "RDM-600", "RDM-300", "RDMN-300", "RDMN-150", "RDM-QB"};
@@ -214,8 +216,9 @@ struct TNCUIState {
 
     bool csma_enabled = true;
     bool csma_sync_only = false;
-    bool csma_fast_floor = false;
+    bool csma_fast_floor = true;
     bool csma_ranked = false;
+    int beacon_interval_s = 45;
     float carrier_threshold_db = -30.0f;
     int slot_time_ms = 500;
     int csma_quiet_ms = 0;
@@ -306,6 +309,7 @@ struct TNCUIState {
     int random_data_size = 0;
     bool fragmentation_enabled = false;
     bool tx_blanking_enabled = false;
+    int tx_delay_ms = 500;
     
     // stats
     std::atomic<float> total_tx_time{0.0f};  
@@ -344,6 +348,13 @@ struct TNCUIState {
         bool com_invert_rts;
     };
     static constexpr int MAX_PRESETS = 10;
+    static constexpr int MAX_FREQ_PRESETS = 12;
+
+    struct FreqPreset {
+        long long hz;
+        std::string label;
+    };
+    std::vector<FreqPreset> freq_presets;
     std::vector<Preset> presets;
     int selected_preset = -1;
     int loaded_preset_index = -1;  
@@ -777,10 +788,13 @@ struct TNCUIState {
         fprintf(f, "robust_mode=%d\n", robust_mode_index);
         fprintf(f, "tx_drive=%.2f\n", tx_drive.load());
         fprintf(f, "alt_mode_mask=%d\n", alt_mode_mask);
+        for (const auto& fp : freq_presets)
+            fprintf(f, "freq_preset=%lld|%s\n", fp.hz, fp.label.c_str());
         fprintf(f, "csma_enabled=%d\n", csma_enabled ? 1 : 0);
         fprintf(f, "csma_sync_only=%d\n", csma_sync_only ? 1 : 0);
         fprintf(f, "csma_fast_floor=%d\n", csma_fast_floor ? 1 : 0);
         fprintf(f, "csma_ranked=%d\n", csma_ranked ? 1 : 0);
+        fprintf(f, "beacon_interval_s=%d\n", beacon_interval_s);
         fprintf(f, "carrier_threshold_db=%.1f\n", carrier_threshold_db);
         fprintf(f, "slot_time_ms=%d\n", slot_time_ms);
         fprintf(f, "csma_quiet_ms=%d\n", csma_quiet_ms);
@@ -802,6 +816,7 @@ struct TNCUIState {
         fprintf(f, "vox_tone_freq=%d\n", vox_tone_freq);
         fprintf(f, "vox_lead_ms=%d\n", vox_lead_ms);
         fprintf(f, "vox_tail_ms=%d\n", vox_tail_ms);
+        fprintf(f, "tx_delay_ms=%d\n", tx_delay_ms);
         fprintf(f, "# COM PTT\n");
         fprintf(f, "com_port=%s\n", com_port.c_str());
         fprintf(f, "com_ptt_line=%d\n", com_ptt_line);
@@ -835,13 +850,23 @@ struct TNCUIState {
         FILE* f = fopen(config_file.c_str(), "r");
         if (!f) return false;
         
+        freq_presets.clear();
+
         char line[512];
         while (fgets(line, sizeof(line), f)) {
             if (line[0] == '#') continue;
-            
+
             char key[64], value[384];
             if (sscanf(line, "%63[^=]=%383[^\n]", key, value) == 2) {
-                if (strcmp(key, "callsign") == 0) callsign = value;
+                if (strcmp(key, "freq_preset") == 0) {
+                    const char* bar = strchr(value, '|');
+                    if (bar && (int)freq_presets.size() < MAX_FREQ_PRESETS) {
+                        long long hz = atoll(std::string(value, bar - value).c_str());
+                        if (hz > 0 && bar[1])
+                            freq_presets.push_back({hz, std::string(bar + 1)});
+                    }
+                }
+                else if (strcmp(key, "callsign") == 0) callsign = value;
                 else if (strcmp(key, "modem_type") == 0) {
                     int v = atoi(value);
                     if (v >= 0 && v <= 2) modem_type_index = v;
@@ -879,6 +904,10 @@ struct TNCUIState {
                 else if (strcmp(key, "csma_sync_only") == 0) csma_sync_only = atoi(value) != 0;
                 else if (strcmp(key, "csma_fast_floor") == 0) csma_fast_floor = atoi(value) != 0;
                 else if (strcmp(key, "csma_ranked") == 0) csma_ranked = atoi(value) != 0;
+                else if (strcmp(key, "beacon_interval_s") == 0) {
+                    int v = atoi(value);
+                    if (v >= 45 && v <= 90) beacon_interval_s = v;
+                }
                 else if (strcmp(key, "carrier_threshold_db") == 0) carrier_threshold_db = atof(value);
                 else if (strcmp(key, "slot_time_ms") == 0) slot_time_ms = atoi(value);
                 else if (strcmp(key, "csma_quiet_ms") == 0) csma_quiet_ms = atoi(value);
@@ -906,6 +935,10 @@ struct TNCUIState {
                 else if (strcmp(key, "vox_tone_freq") == 0) {
                     int v = atoi(value);
                     if (v >= 300 && v <= 3000) vox_tone_freq = v;
+                }
+                else if (strcmp(key, "tx_delay_ms") == 0) {
+                    int v = atoi(value);
+                    if (v >= 250 && v <= 2500) tx_delay_ms = v;
                 }
                 else if (strcmp(key, "vox_lead_ms") == 0) {
                     int v = atoi(value);
@@ -1414,6 +1447,7 @@ public:
 private:
     enum Field {
         FIELD_CALLSIGN = 0,
+        FIELD_CONFIG_TOKEN,
         FIELD_MODEM_TYPE,
         FIELD_MODULATION,
         FIELD_CODERATE,
@@ -1424,11 +1458,9 @@ private:
         FIELD_ROBUST_MTU,
         FIELD_FREQ,
         FIELD_CSMA,
+        FIELD_CSMA_MODE,
+        FIELD_CSMA_HELP,
         FIELD_THRESHOLD,
-        FIELD_SYNC_ONLY,
-        FIELD_SYNC_INFO,
-        FIELD_RANKED,
-        FIELD_RANKED_INFO,
         FIELD_CSMA_BAND,
         FIELD_CSMA_PRESET,
         FIELD_CSMA_ADV,
@@ -1438,6 +1470,7 @@ private:
         FIELD_RESP_DITHER,
         FIELD_CSMA_BURST,
         FIELD_FAST_FLOOR,
+        FIELD_BEACON_INT,
         FIELD_CSMA_INFO,
         FIELD_FRAGMENTATION,
         FIELD_TX_BLANKING,
@@ -1457,6 +1490,7 @@ private:
         FIELD_CM108_GPIO,
         FIELD_CM108_DEVICE,
 #endif
+        FIELD_TX_DELAY,
         FIELD_NET_PORT,
         FIELD_CONTROL_PORT,
         FIELD_PRESET,
@@ -1466,6 +1500,7 @@ private:
     enum RigField {
         RIG_FIELD_FREQ = 0,
         RIG_FIELD_STEP,
+        RIG_FIELD_PRESET,
         RIG_FIELD_MODE,
         RIG_FIELD_POWER,
         RIG_FIELD_DRIVE,
@@ -1568,10 +1603,6 @@ private:
         }
         if (show_sync_help_) {
             show_sync_help_ = false;
-            return;
-        }
-        if (show_ranked_help_) {
-            show_ranked_help_ = false;
             return;
         }
 
@@ -1722,12 +1753,12 @@ private:
             case '\n':
             case KEY_ENTER:
                 if (current_tab_ == 1) {
-                    if (current_field_ == FIELD_CSMA_INFO) {
+                    if (current_field_ == FIELD_CONFIG_TOKEN) {
+                        open_config_token();
+                    } else if (current_field_ == FIELD_CSMA_INFO) {
                         show_csma_help_ = true;
-                    } else if (current_field_ == FIELD_SYNC_INFO) {
+                    } else if (current_field_ == FIELD_CSMA_HELP) {
                         show_sync_help_ = true;
-                    } else if (current_field_ == FIELD_RANKED_INFO) {
-                        show_ranked_help_ = true;
                     } else if (current_field_ == FIELD_CSMA_ADV) {
                         state_.csma_advanced_open = !state_.csma_advanced_open;
                     } else if (current_field_ == FIELD_CALLSIGN) {
@@ -1803,14 +1834,22 @@ private:
 
                     save_preset_dialog();
 
+                } else if (current_tab_ == 5 && rig_field_ == RIG_FIELD_PRESET) {
+
+                    save_freq_preset_dialog();
+
                 }
                 break;
-            
-            case KEY_DC:  
+
+            case KEY_DC:
             case 'x':
                 if (current_tab_ == 1 && current_field_ == FIELD_PRESET) {
 
                     delete_selected_preset();
+
+                } else if (current_tab_ == 5 && rig_field_ == RIG_FIELD_PRESET) {
+
+                    delete_selected_freq_preset();
 
                 }
                 break;
@@ -1924,12 +1963,12 @@ private:
                     if (should_skip_field(f)) continue;
                     if (config_field_row(f) == logical) { field = f; break; }
                 }
+                if (field == FIELD_CONFIG_TOKEN)
+                    open_config_token();
                 if (field == FIELD_CSMA_INFO)
                     show_csma_help_ = true;
-                if (field == FIELD_SYNC_INFO)
+                if (field == FIELD_CSMA_HELP)
                     show_sync_help_ = true;
-                if (field == FIELD_RANKED_INFO)
-                    show_ranked_help_ = true;
                 
                 if (field >= 0 && field < FIELD_COUNT) {
                     current_field_ = field;
@@ -2143,6 +2182,144 @@ private:
         }
     }
 
+    int csma_mode() const {
+        if (!state_.csma_sync_only) return 0;
+        return state_.csma_ranked ? 2 : 1;
+    }
+
+    void set_csma_mode(int m) {
+        state_.csma_sync_only = (m >= 1);
+        state_.csma_ranked = (m == 2);
+        if (m == 2 && !state_.tx_lead_tone) {
+            state_.tx_lead_tone = true;
+            state_.add_log("Ranked: lead tone enabled");
+        }
+    }
+
+    ConfigToken::Profile profile_from_state() {
+        ConfigToken::Profile p;
+        p.modem_type = state_.modem_type_index;
+        p.mfsk_mode = state_.mfsk_mode_index;
+        p.robust_mode = state_.robust_mode_index;
+        p.modulation = state_.modulation_index;
+        p.code_rate = state_.code_rate_index;
+        p.frame_size = state_.frame_size;
+        p.postamble = state_.postamble ? 1 : 0;
+        p.center_freq = state_.center_freq;
+        p.csma_enabled = state_.csma_enabled ? 1 : 0;
+        p.csma_mode = csma_mode();
+        p.csma_band = state_.csma_band;
+        p.fast_floor = state_.csma_fast_floor ? 1 : 0;
+        p.lead_tone = state_.tx_lead_tone ? 1 : 0;
+        p.threshold_db = (int)lroundf(state_.carrier_threshold_db);
+        p.quiet_ms = state_.csma_quiet_ms;
+        p.cw = state_.csma_cw;
+        p.slot_ms = state_.slot_time_ms;
+        p.burst = state_.csma_burst;
+        p.dither_ms = state_.csma_responder_dither;
+        p.p_persistence = state_.p_persistence;
+        p.fragmentation = state_.fragmentation_enabled ? 1 : 0;
+        p.tx_blanking = state_.tx_blanking_enabled ? 1 : 0;
+        p.rx_ofdm = state_.ofdm_rx_enabled ? 1 : 0;
+        p.rx_robust = state_.robust_rx_enabled ? 1 : 0;
+        p.rx_mfsk = state_.mfsk_rx_enabled ? 1 : 0;
+        p.vox_freq = state_.vox_tone_freq;
+        p.vox_lead_ms = state_.vox_lead_ms;
+        p.vox_tail_ms = state_.vox_tail_ms;
+        return p;
+    }
+
+    void apply_profile(const ConfigToken::Profile& p) {
+        state_.modem_type_index = std::clamp(p.modem_type, 0, 2);
+        state_.mfsk_mode_index = std::clamp(p.mfsk_mode, 0, 3);
+        state_.robust_mode_index = std::clamp(p.robust_mode, 0, ROBUST_MODE_COUNT - 1);
+        state_.modulation_index = std::clamp(p.modulation, 0, 7);
+        state_.code_rate_index = std::clamp(p.code_rate, 0, 4);
+        state_.frame_size = std::clamp(p.frame_size, 0, 3);
+        state_.postamble = p.postamble != 0;
+        state_.center_freq = std::clamp(p.center_freq, 300, 2700);
+        state_.clamp_micro();
+        state_.csma_enabled = p.csma_enabled != 0;
+        state_.tx_lead_tone = p.lead_tone != 0;
+        state_.csma_band = std::clamp(p.csma_band, 0, 1);
+        set_csma_mode(std::clamp(p.csma_mode, 0, 2));
+        state_.csma_fast_floor = p.fast_floor != 0;
+        state_.carrier_threshold_db = (float)std::clamp(p.threshold_db, -63, 0);
+        state_.csma_quiet_ms = std::clamp(p.quiet_ms, 0, 3100);
+        state_.csma_cw = std::clamp(p.cw, 2, 15);
+        state_.slot_time_ms = std::clamp(p.slot_ms, 50, 1550);
+        state_.csma_burst = std::clamp(p.burst, 1, 7);
+        state_.csma_responder_dither = std::clamp(p.dither_ms, 0, 750);
+        state_.p_persistence = std::clamp(p.p_persistence, 0, 255);
+        state_.fragmentation_enabled = p.fragmentation != 0;
+        state_.tx_blanking_enabled = p.tx_blanking != 0;
+        state_.ofdm_rx_enabled = p.rx_ofdm != 0;
+        state_.robust_rx_enabled = p.rx_robust != 0;
+        state_.mfsk_rx_enabled = p.rx_mfsk != 0;
+        state_.vox_tone_freq = std::clamp(p.vox_freq, 300, 3000);
+        state_.vox_lead_ms = std::clamp(p.vox_lead_ms, 0, 310);
+        state_.vox_tail_ms = std::clamp(p.vox_tail_ms, 0, 310);
+        state_.update_modem_info();
+        apply_settings();
+    }
+
+    void open_config_token() {
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        std::string mine = ConfigToken::encode(profile_from_state());
+        int w = 56, h = 14;
+        int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        attron(COLOR_PAIR(4));
+        for (int y = y0; y < y0 + h && y < rows; y++)
+            mvhline(y, x0, ' ', w);
+        mvhline(y0, x0, ACS_HLINE, w);
+        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
+        mvvline(y0, x0, ACS_VLINE, h);
+        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
+        mvaddch(y0, x0, ACS_ULCORNER);
+        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
+        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
+        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
+        attron(A_BOLD);
+        mvaddstr(y0, x0 + 3, " CONFIG TOKEN ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+
+        int y = y0 + 2, lx = x0 + 2;
+        mvaddstr(y++, lx, "Share this so others match your setup:");
+        y++;
+        attron(A_BOLD);
+        mvaddstr(y++, lx + 1, mine.c_str());
+        attroff(A_BOLD);
+        y++;
+        attron(A_DIM);
+        mvaddstr(y++, lx, "Mouse mode is on, so hold Shift and drag to select.");
+        mvaddstr(y++, lx, "Copy with Ctrl+Shift+C, paste with Ctrl+Shift+V.");
+        mvaddstr(y++, lx, "Right-click also pastes in Windows Terminal.");
+        attroff(A_DIM);
+        y++;
+        mvaddstr(y++, lx, "Paste one to apply, or leave blank:");
+
+        char buf[160] = {0};
+        if (!prompt_input(y, lx + 1, buf, 44) || strlen(buf) == 0)
+            return;
+
+        ConfigToken::Profile p = profile_from_state();
+        std::string err;
+        ConfigToken::Result res;
+        if (!ConfigToken::decode(buf, &p, &err, &res)) {
+            state_.add_log("(!) Config token: " + err);
+            return;
+        }
+        apply_profile(p);
+        state_.add_log("Config token applied, " + std::to_string(res.applied) +
+                       " settings changed");
+        if (res.extra_bits > 0)
+            state_.add_log("(!) Token also has newer settings this build ignores");
+    }
+
     bool should_skip_field(int field) {
         if (field == FIELD_FREQ) return true;
         // Hide OFDM-only fields when in MFSK mode
@@ -2174,15 +2351,23 @@ private:
         if (!state_.csma_advanced_open) {
             if (field == FIELD_CSMA_QUIET || field == FIELD_CSMA_CW ||
                 field == FIELD_LEAD_TONE || field == FIELD_RESP_DITHER ||
-                field == FIELD_CSMA_BURST || field == FIELD_FAST_FLOOR)
+                field == FIELD_CSMA_BURST || field == FIELD_FAST_FLOOR ||
+                field == FIELD_BEACON_INT)
                 return true;
         }
-        if (state_.csma_sync_only) {
-            if (field == FIELD_THRESHOLD || field == FIELD_CSMA_CW)
+        {
+            int m = csma_mode();
+            if (m != 0 && (field == FIELD_THRESHOLD || field == FIELD_CSMA_CW))
                 return true;
-        } else {
-            if (field == FIELD_FAST_FLOOR || field == FIELD_RANKED ||
-                field == FIELD_RANKED_INFO)
+            if (m != 1 && field == FIELD_FAST_FLOOR)
+                return true;
+            if (m != 2 && field == FIELD_BEACON_INT)
+                return true;
+            if (m == 2 && (field == FIELD_CSMA_QUIET ||
+                           field == FIELD_LEAD_TONE ||
+                           field == FIELD_RESP_DITHER ||
+                           field == FIELD_CSMA_BAND ||
+                           field == FIELD_CSMA_PRESET))
                 return true;
         }
         return false;
@@ -2195,6 +2380,8 @@ private:
         int row = 0;
         row++;
         if (field == FIELD_CALLSIGN) return row;
+        row++;
+        if (field == FIELD_CONFIG_TOKEN) return row;
         row++;
         if (field == FIELD_MODEM_TYPE) return row;
         row++;
@@ -2220,42 +2407,47 @@ private:
         row++;
         if (field == FIELD_CSMA) return row;
         row++;
-        if (!state_.csma_sync_only) {
+        if (field == FIELD_CSMA_MODE) return row;
+        row++;
+        if (field == FIELD_CSMA_HELP) return row;
+        row++;
+        if (csma_mode() == 0) {
             if (field == FIELD_THRESHOLD) return row;
             row++;
             row++;
         }
-        if (field == FIELD_SYNC_ONLY) return row;
-        row++;
-        if (field == FIELD_SYNC_INFO) return row;
-        row++;
-        if (state_.csma_sync_only) {
-            if (field == FIELD_RANKED) return row;
+        if (csma_mode() != 2) {
+            if (field == FIELD_CSMA_BAND) return row;
             row++;
-            if (field == FIELD_RANKED_INFO) return row;
+            if (field == FIELD_CSMA_PRESET) return row;
             row++;
         }
-        if (field == FIELD_CSMA_BAND) return row;
-        row++;
-        if (field == FIELD_CSMA_PRESET) return row;
-        row++;
         if (field == FIELD_CSMA_ADV) return row;
         row++;
         if (state_.csma_advanced_open) {
-            if (field == FIELD_CSMA_QUIET) return row;
-            row++;
-            if (!state_.csma_sync_only) {
+            int m = csma_mode();
+            if (m != 2) {
+                if (field == FIELD_CSMA_QUIET) return row;
+                row++;
+            }
+            if (m == 0) {
                 if (field == FIELD_CSMA_CW) return row;
                 row++;
             }
-            if (field == FIELD_LEAD_TONE) return row;
-            row++;
-            if (field == FIELD_RESP_DITHER) return row;
-            row++;
+            if (m != 2) {
+                if (field == FIELD_LEAD_TONE) return row;
+                row++;
+                if (field == FIELD_RESP_DITHER) return row;
+                row++;
+            }
             if (field == FIELD_CSMA_BURST) return row;
             row++;
-            if (state_.csma_sync_only) {
+            if (m == 1) {
                 if (field == FIELD_FAST_FLOOR) return row;
+                row++;
+            }
+            if (m == 2) {
+                if (field == FIELD_BEACON_INT) return row;
                 row++;
             }
         }
@@ -2305,6 +2497,8 @@ private:
             row++;
         }
 #endif
+        if (field == FIELD_TX_DELAY) return row;
+        row++;
         row++;
         row++;
         if (field == FIELD_NET_PORT) return row;
@@ -2392,8 +2586,8 @@ private:
                 state_.carrier_threshold_db += delta * 2;
                 state_.carrier_threshold_db = std::max(-80.0f, std::min(0.0f, state_.carrier_threshold_db));
                 break;
-            case FIELD_SYNC_ONLY:
-                state_.csma_sync_only = !state_.csma_sync_only;
+            case FIELD_CSMA_MODE:
+                set_csma_mode((csma_mode() + delta % 3 + 3) % 3);
                 break;
             case FIELD_CSMA_BAND: {
                 int matched = csma_preset_match();
@@ -2434,12 +2628,9 @@ private:
             case FIELD_FAST_FLOOR:
                 state_.csma_fast_floor = !state_.csma_fast_floor;
                 break;
-            case FIELD_RANKED:
-                state_.csma_ranked = !state_.csma_ranked;
-                if (state_.csma_ranked && !state_.tx_lead_tone) {
-                    state_.tx_lead_tone = true;
-                    state_.add_log("Ranked: lead tone enabled");
-                }
+            case FIELD_BEACON_INT:
+                state_.beacon_interval_s += delta * 15;
+                state_.beacon_interval_s = std::max(45, std::min(90, state_.beacon_interval_s));
                 break;
             case FIELD_FRAGMENTATION:
                 state_.fragmentation_enabled = !state_.fragmentation_enabled;
@@ -2469,6 +2660,10 @@ private:
             case FIELD_VOX_FREQ:
                 state_.vox_tone_freq += delta * 100;
                 state_.vox_tone_freq = std::max(300, std::min(2500, state_.vox_tone_freq));
+                break;
+            case FIELD_TX_DELAY:
+                state_.tx_delay_ms += delta * 50;
+                state_.tx_delay_ms = std::max(250, std::min(2500, state_.tx_delay_ms));
                 break;
             case FIELD_VOX_LEAD:
                 state_.vox_lead_ms += delta * 50;
@@ -3404,9 +3599,6 @@ private:
         if (show_sync_help_) {
             draw_sync_only_help(rows, cols);
         }
-        if (show_ranked_help_) {
-            draw_ranked_help(rows, cols);
-        }
     }
     
     void draw_status(int y, int h, int cols) {
@@ -3583,7 +3775,10 @@ private:
         y++;
 
         mvaddstr(y, c1, "Quiet");
-        if (state_.csma_quiet_ms > 0) {
+        if (state_.csma_ranked && state_.csma_sync_only &&
+            state_.csma_rank.load() >= 0) {
+            mvprintw(y, c2, "%d ms (ranked)", RANKED_QUIET_DISPLAY_MS);
+        } else if (state_.csma_quiet_ms > 0) {
             mvprintw(y, c2, "%d ms", state_.csma_quiet_ms);
         } else {
             int q = (int)(state_.airtime_seconds * 1000.0f) / 4;
@@ -3634,9 +3829,11 @@ private:
                 attron(COLOR_PAIR(4));
                 {
                     int rk = state_.csma_rank.load();
-                    if (rk >= 0)
-                        printw("turn %d/%d in %d ms", rk + 1,
-                               state_.csma_rank_n.load(),
+                    int rn = state_.csma_rank_n.load();
+                    if (rk >= rn && rk >= 0)
+                        printw("yielding %d ms", state_.csma_wait_ms.load());
+                    else if (rk >= 0)
+                        printw("turn %d/%d in %d ms", rk + 1, rn,
                                state_.csma_wait_ms.load());
                     else
                         printw("contending %d ms", state_.csma_wait_ms.load());
@@ -4125,6 +4322,15 @@ private:
         row++;
 
         dy = visible_y(row);
+        if (dy >= 0) {
+            bool sel_t = (current_field_ == FIELD_CONFIG_TOKEN);
+            if (sel_t) attron(A_BOLD); else attron(A_DIM);
+            mvprintw(dy, c1, "%s[#] Config Token (copy or paste)", sel_t ? "> " : "  ");
+            if (sel_t) attroff(A_BOLD); else attroff(A_DIM);
+        }
+        row++;
+
+        dy = visible_y(row);
         if (dy >= 0) draw_modem_tabs(dy, c1, c2, divider);
         row++;
 
@@ -4181,8 +4387,32 @@ private:
         dy = visible_y(row);
         if (dy >= 0) draw_toggle_field(dy, c1, c2, "Enabled", FIELD_CSMA, state_.csma_enabled);
         row++;
-        
-        if (!state_.csma_sync_only) {
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            static const char* MODE_NAMES[3] = {"THRESHOLD", "SYNC", "RANKED"};
+            static const char* MODE_HINT[3] = {
+                "busy = any audio over Threshold",
+                "busy = a real modem signal only",
+                "SYNC plus stations take turns"};
+            int m = csma_mode();
+            draw_selector_field(dy, c1, c2, "Mode", FIELD_CSMA_MODE, MODE_NAMES[m]);
+            attron(A_DIM);
+            mvaddstr(dy, c2 + 12, MODE_HINT[m]);
+            attroff(A_DIM);
+        }
+        row++;
+
+        dy = visible_y(row);
+        if (dy >= 0) {
+            bool sel_h = (current_field_ == FIELD_CSMA_HELP);
+            if (sel_h) attron(A_BOLD); else attron(A_DIM);
+            mvprintw(dy, c1 + 2, "%s[?] Which one should I use?", sel_h ? "> " : "  ");
+            if (sel_h) attroff(A_BOLD); else attroff(A_DIM);
+        }
+        row++;
+
+        if (csma_mode() == 0) {
             dy = visible_y(row);
             if (dy >= 0) {
                 char thresh_buf[32];
@@ -4200,7 +4430,6 @@ private:
             }
             row++;
 
-            // Level meter bar
             dy = visible_y(row);
             if (dy >= 0) {
                 mvaddstr(dy, c1, "Level");
@@ -4211,40 +4440,7 @@ private:
             row++;
         }
 
-        dy = visible_y(row);
-        if (dy >= 0) {
-            draw_toggle_field(dy, c1, c2, "Sync Only", FIELD_SYNC_ONLY, state_.csma_sync_only);
-            attron(A_DIM);
-            mvaddstr(dy, c2 + 8, "busy = carrier sync only");
-            attroff(A_DIM);
-        }
-        row++;
-
-        dy = visible_y(row);
-        if (dy >= 0) {
-            bool sel_sinfo = (current_field_ == FIELD_SYNC_INFO);
-            if (sel_sinfo) attron(A_BOLD); else attron(A_DIM);
-            mvprintw(dy, c1 + 2, "%s[?] What is this?", sel_sinfo ? "> " : "  ");
-            if (sel_sinfo) attroff(A_BOLD); else attroff(A_DIM);
-        }
-        row++;
-
-        if (state_.csma_sync_only) {
-            dy = visible_y(row);
-            if (dy >= 0) draw_toggle_field(dy, c1, c2, "Ranked", FIELD_RANKED,
-                                           state_.csma_ranked);
-            row++;
-
-            dy = visible_y(row);
-            if (dy >= 0) {
-                bool sel_rinfo = (current_field_ == FIELD_RANKED_INFO);
-                if (sel_rinfo) attron(A_BOLD); else attron(A_DIM);
-                mvprintw(dy, c1 + 2, "%s[?] What is this?", sel_rinfo ? "> " : "  ");
-                if (sel_rinfo) attroff(A_BOLD); else attroff(A_DIM);
-            }
-            row++;
-        }
-
+        if (csma_mode() != 2) {
         dy = visible_y(row);
         if (dy >= 0) draw_selector_field(dy, c1, c2, "Band", FIELD_CSMA_BAND,
                                          CSMA_BAND_NAMES[state_.csma_band & 1]);
@@ -4258,6 +4454,7 @@ private:
                                           : "CUSTOM");
         }
         row++;
+        }
 
         dy = visible_y(row);
         if (dy >= 0) {
@@ -4270,6 +4467,8 @@ private:
         row++;
 
         if (state_.csma_advanced_open) {
+            int m = csma_mode();
+            if (m != 2) {
             dy = visible_y(row);
             if (dy >= 0) {
                 char quiet_buf[32];
@@ -4280,8 +4479,9 @@ private:
                 draw_selector_field(dy, c1 + 2, c2, "Quiet", FIELD_CSMA_QUIET, quiet_buf);
             }
             row++;
+            }
 
-            if (!state_.csma_sync_only) {
+            if (m == 0) {
                 dy = visible_y(row);
                 if (dy >= 0) {
                     char cw_buf[32];
@@ -4291,6 +4491,7 @@ private:
                 row++;
             }
 
+            if (m != 2) {
             dy = visible_y(row);
             if (dy >= 0) draw_toggle_field(dy, c1 + 2, c2, "Lead Tone", FIELD_LEAD_TONE, state_.tx_lead_tone);
             row++;
@@ -4302,9 +4503,10 @@ private:
                     snprintf(dith_buf, sizeof(dith_buf), "%d ms", state_.csma_responder_dither);
                 else
                     snprintf(dith_buf, sizeof(dith_buf), "OFF");
-                draw_selector_field(dy, c1 + 2, c2, "Resp Dither", FIELD_RESP_DITHER, dith_buf);
+                draw_selector_field(dy, c1 + 2, c2, "Reply Offset", FIELD_RESP_DITHER, dith_buf);
             }
             row++;
+            }
 
             dy = visible_y(row);
             if (dy >= 0) {
@@ -4317,7 +4519,7 @@ private:
             }
             row++;
 
-            if (state_.csma_sync_only) {
+            if (m == 1) {
                 dy = visible_y(row);
                 if (dy >= 0) {
                     draw_toggle_field(dy, c1 + 2, c2, "Fast Floor", FIELD_FAST_FLOOR,
@@ -4325,6 +4527,15 @@ private:
                     attron(A_DIM);
                     mvaddstr(dy, c2 + 8, "only if all stations run 2.3>");
                     attroff(A_DIM);
+                }
+                row++;
+            }
+            if (m == 2) {
+                dy = visible_y(row);
+                if (dy >= 0) {
+                    char bi_buf[16];
+                    snprintf(bi_buf, sizeof(bi_buf), "%d s", state_.beacon_interval_s);
+                    draw_selector_field(dy, c1 + 2, c2, "Presence Ivl", FIELD_BEACON_INT, bi_buf);
                 }
                 row++;
             }
@@ -4517,6 +4728,13 @@ private:
             row++;
         }
 #endif
+        dy = visible_y(row);
+        if (dy >= 0) {
+            char txd_buf[24];
+            snprintf(txd_buf, sizeof(txd_buf), "%d ms", state_.tx_delay_ms);
+            draw_selector_field(dy, c1, c2, "TX Delay", FIELD_TX_DELAY, txd_buf);
+        }
+        row++;
         row++;
         
         // Network section
@@ -6130,6 +6348,12 @@ private:
                 set_rig_freq(nf);
                 break;
             }
+            case RIG_FIELD_PRESET: {
+                int n = (int)state_.freq_presets.size();
+                if (n > 0)
+                    rig_preset_index_ = (rig_preset_index_ + delta % n + n) % n;
+                break;
+            }
             case RIG_FIELD_STEP:
                 rig_step_index_ = (rig_step_index_ + delta + RIG_STEP_COUNT) % RIG_STEP_COUNT;
                 break;
@@ -6196,6 +6420,14 @@ private:
     void rig_enter_action() {
         if (rig_field_ == RIG_FIELD_FREQ) {
             edit_rig_freq();
+        } else if (rig_field_ == RIG_FIELD_PRESET) {
+            if (state_.freq_presets.empty()) {
+                state_.add_log("Rig: no frequency presets, press s to save one");
+            } else if (rig_preset_index_ < (int)state_.freq_presets.size()) {
+                const auto& fp = state_.freq_presets[rig_preset_index_];
+                set_rig_freq(fp.hz);
+                state_.add_log("Rig: " + fp.label + " " + format_freq(fp.hz));
+            }
         } else if (rig_field_ == RIG_FIELD_DRIVE) {
             if (!state_.on_alc_tune) {
                 state_.add_log("ALC tune: unavailable");
@@ -6229,6 +6461,65 @@ private:
             }
             state_.rig_refresh_requested = true;
         }
+    }
+
+    void save_freq_preset_dialog() {
+        if ((int)state_.freq_presets.size() >= TNCUIState::MAX_FREQ_PRESETS) {
+            state_.add_log("Rig: maximum frequency presets reached");
+            return;
+        }
+        long long hz = state_.rig_freq_hz.load();
+        if (hz <= 0) {
+            state_.add_log("Rig: no frequency read from rig yet");
+            return;
+        }
+
+        int rows, cols;
+        getmaxyx(stdscr, rows, cols);
+        int dialog_w = 44, dialog_h = 5;
+        int dx = (cols - dialog_w) / 2, dy = (rows - dialog_h) / 2;
+
+        attron(COLOR_PAIR(4));
+        for (int i = dy; i < dy + dialog_h && i < rows; i++)
+            mvhline(i, dx, ' ', dialog_w);
+        draw_box(dy, dx, dialog_h, dialog_w);
+        attron(A_BOLD);
+        mvaddstr(dy, dx + 3, " SAVE PRESET ");
+        attroff(A_BOLD);
+        attroff(COLOR_PAIR(4));
+        attron(A_DIM);
+        mvprintw(dy + 1, dx + 2, "%s  label:", format_freq(hz).c_str());
+        attroff(A_DIM);
+
+        char buf[21] = {0};
+        if (!prompt_input(dy + 2, dx + 2, buf, 20))
+            return;
+        std::string label = buf;
+        while (!label.empty() && label.back() == ' ') label.pop_back();
+        if (label.empty()) {
+            state_.add_log("Rig: preset not saved, label was empty");
+            return;
+        }
+
+        state_.freq_presets.push_back({hz, label});
+        rig_preset_index_ = (int)state_.freq_presets.size() - 1;
+        state_.save_settings();
+        state_.add_log("Rig: preset saved, " + label + " " + format_freq(hz));
+    }
+
+    void delete_selected_freq_preset() {
+        if (state_.freq_presets.empty()) {
+            state_.add_log("Rig: no frequency presets to delete");
+            return;
+        }
+        if (rig_preset_index_ >= (int)state_.freq_presets.size())
+            rig_preset_index_ = (int)state_.freq_presets.size() - 1;
+        std::string label = state_.freq_presets[rig_preset_index_].label;
+        state_.freq_presets.erase(state_.freq_presets.begin() + rig_preset_index_);
+        if (rig_preset_index_ >= (int)state_.freq_presets.size())
+            rig_preset_index_ = std::max(0, (int)state_.freq_presets.size() - 1);
+        state_.save_settings();
+        state_.add_log("Rig: preset deleted, " + label);
     }
 
     void edit_rig_freq() {
@@ -6334,6 +6625,23 @@ private:
                                RIG_STEP_LABELS[rig_step_index_]);
         y++;
 
+        {
+            char pbuf[80];
+            if (state_.freq_presets.empty()) {
+                snprintf(pbuf, sizeof(pbuf), "(none)  s=save current");
+            } else {
+                if (rig_preset_index_ >= (int)state_.freq_presets.size())
+                    rig_preset_index_ = 0;
+                const auto& fp = state_.freq_presets[rig_preset_index_];
+                snprintf(pbuf, sizeof(pbuf), "%s  %s  (%d/%d)",
+                         format_freq(fp.hz).c_str(), fp.label.c_str(),
+                         rig_preset_index_ + 1, (int)state_.freq_presets.size());
+            }
+            draw_selector_field_ex(y, c1, c2, "Preset",
+                                   rig_field_ == RIG_FIELD_PRESET, pbuf);
+            y++;
+        }
+
         std::string mode = state_.get_rig_mode();
         draw_selector_field_ex(y, c1, c2, "Mode", rig_field_ == RIG_FIELD_MODE,
                                mode.empty() ? "---" : mode);
@@ -6396,7 +6704,7 @@ private:
         }
 
         attron(A_DIM);
-        mvaddstr(y, c1, "Freq: Enter=type, </> step");
+        mvaddstr(y, c1, "Freq: Enter=type, </> step   Preset: Enter=go, s=save, x=del");
         attroff(A_DIM);
 
         int ry = top;
@@ -6575,48 +6883,11 @@ private:
         attroff(A_DIM);
     }
 
-    void draw_ranked_help(int rows, int cols) {
-        int w = 58, h = 17;
-        int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
-        attron(COLOR_PAIR(4));
-        for (int y = y0; y < y0 + h && y < rows; y++)
-            mvhline(y, x0, ' ', w);
-        mvhline(y0, x0, ACS_HLINE, w);
-        mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-        mvvline(y0, x0, ACS_VLINE, h);
-        mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-        mvaddch(y0, x0, ACS_ULCORNER);
-        mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-        mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-        mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
-        attron(A_BOLD);
-        mvaddstr(y0, x0 + 3, " RANKED ");
-        attroff(A_BOLD);
-        attroff(COLOR_PAIR(4));
-        int y = y0 + 2, lx = x0 + 2;
-        mvaddstr(y++, lx, "Take turns instead of gambling.");
-        y++;
-        attron(A_BOLD); mvaddstr(y, lx, "OFF"); attroff(A_BOLD);
-        mvaddstr(y++, lx + 5, "every station waits a random time before");
-        mvaddstr(y++, lx + 5, "keying up, sometimes colliding anyway.");
-        attron(A_BOLD); mvaddstr(y, lx, "ON"); attroff(A_BOLD);
-        mvaddstr(y++, lx + 5, "stations that hear each other agree on an");
-        mvaddstr(y++, lx + 5, "order from their ID tones and go in turn.");
-        y++;
-        mvaddstr(y++, lx, "Usually 3-7x faster channel access when two or");
-        mvaddstr(y++, lx, "more stations share the frequency.");
-        y++;
-        mvaddstr(y++, lx, "All stations need Ranked AND Lead Tone on. Ones");
-        mvaddstr(y++, lx, "without it still work with their random waits,");
-        mvaddstr(y++, lx, "they are just left out of the turn order.");
-        attron(A_DIM);
-        mvaddstr(y, lx, "any key to close");
-        attroff(A_DIM);
-    }
-
     void draw_sync_only_help(int rows, int cols) {
-        int w = 58, h = 22;
+        int w = 60, h = 24;
         int x0 = (cols - w) / 2, y0 = (rows - h) / 2;
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
         attron(COLOR_PAIR(4));
         for (int y = y0; y < y0 + h && y < rows; y++)
             mvhline(y, x0, ' ', w);
@@ -6629,30 +6900,49 @@ private:
         mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
         mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
         attron(A_BOLD);
-        mvaddstr(y0, x0 + 3, " SYNC ONLY ");
+        mvaddstr(y0, x0 + 3, " WHICH MODE ");
         attroff(A_BOLD);
         attroff(COLOR_PAIR(4));
+
         int y = y0 + 2, lx = x0 + 2;
-        mvaddstr(y++, lx, "How the radio decides the channel is busy.");
-        y++;
-        attron(A_BOLD); mvaddstr(y, lx, "OFF"); attroff(A_BOLD);
-        mvaddstr(y++, lx + 5, "any sound louder than Threshold counts as");
-        mvaddstr(y++, lx + 5, "busy. Reacts fast, but noise fools it.");
-        attron(A_BOLD); mvaddstr(y, lx, "ON"); attroff(A_BOLD);
-        mvaddstr(y++, lx + 5, "only a real modem transmission counts as");
-        mvaddstr(y++, lx + 5, "busy. Static and noise are ignored.");
-        y++;
-        attron(A_BOLD); mvaddstr(y++, lx, "Why use it on HF:"); attroff(A_BOLD);
-        mvaddstr(y++, lx, "HF is full of static, fading and nearby signals.");
-        mvaddstr(y++, lx, "With Sync Only OFF that noise looks busy, so your");
-        mvaddstr(y++, lx, "radio can wait forever for a quiet that never");
-        mvaddstr(y++, lx, "comes. ON waits only for actual stations, at the");
-        mvaddstr(y++, lx, "cost of noticing them a little later.");
-        y++;
-        mvaddstr(y++, lx, "VHF/UHF FM is usually quiet, so OFF works there.");
-        mvaddstr(y++, lx, "Ranked takes TX turns in station ID order instead");
-        mvaddstr(y++, lx, "of random waits. Needs the lead tone on.");
+        attron(A_BOLD);
+        mvaddstr(y++, lx, "Can every station hear every other one?");
+        attroff(A_BOLD);
         attron(A_DIM);
+        mvaddstr(y++, lx, "local net, one NVIS region, VHF simplex, repeater");
+        attroff(A_DIM);
+        y++;
+        attron(COLOR_PAIR(2) | A_BOLD); mvaddstr(y, lx + 1, "NO"); attroff(COLOR_PAIR(2) | A_BOLD);
+        mvaddstr(y++, lx + 6, "Use THRESHOLD or SYNC.");
+        attron(A_DIM);
+        mvaddstr(y++, lx + 6, "RANKED makes hidden stations collide more.");
+        attroff(A_DIM);
+        y++;
+        attron(COLOR_PAIR(1) | A_BOLD); mvaddstr(y, lx + 1, "YES"); attroff(COLOR_PAIR(1) | A_BOLD);
+        attron(A_BOLD);
+        mvaddstr(y++, lx + 6, "Are you on HF / Is the channel noisy?");
+        attroff(A_BOLD);
+        attron(A_DIM);
+        mvaddstr(y++, lx + 6, "static, QRM, signals that are not modem73");
+        attroff(A_DIM);
+        y++;
+        attron(COLOR_PAIR(2) | A_BOLD); mvaddstr(y, lx + 8, "NO"); attroff(COLOR_PAIR(2) | A_BOLD);
+        mvaddstr(y++, lx + 13, "THRESHOLD. Good for quiet VHF/UHF+.");
+        y++;
+        attron(COLOR_PAIR(1) | A_BOLD); mvaddstr(y, lx + 8, "YES"); attroff(COLOR_PAIR(1) | A_BOLD);
+        attron(A_BOLD);
+        mvaddstr(y++, lx + 13, "Do all stations run 2.3 or");
+        mvaddstr(y++, lx + 13, "newer with RANKED on?");
+        attroff(A_BOLD);
+        y++;
+        attron(COLOR_PAIR(2) | A_BOLD); mvaddstr(y, lx + 15, "NO"); attroff(COLOR_PAIR(2) | A_BOLD);
+        mvaddstr(y++, lx + 20, "SYNC.");
+        attron(COLOR_PAIR(1) | A_BOLD); mvaddstr(y, lx + 15, "YES"); attroff(COLOR_PAIR(1) | A_BOLD);
+        mvaddstr(y++, lx + 20, "RANKED. 3 to 7x faster.");
+        y++;
+        attron(A_DIM);
+        mvaddstr(y++, lx, "RANKED turns on the Lead Tone and Presence Tone");
+        mvaddstr(y++, lx, "it needs. Every station must run it.");
         mvaddstr(y, lx, "any key to close");
         attroff(A_DIM);
     }
@@ -6852,12 +7142,12 @@ private:
     int occ_hist_pos_ = 0;
     int64_t occ_hist_ms_ = 0;
     int rig_step_index_ = 2;
+    int rig_preset_index_ = 0;
     int saved_stderr_ = -1;
     int frame_counter_ = 0;  
     bool show_help_ = false;  
     bool show_csma_help_ = false;
     bool show_sync_help_ = false;
-    bool show_ranked_help_ = false;
     
     bool calibrating_threshold_ = false;
     int calibration_start_frame_ = 0;
