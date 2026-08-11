@@ -594,10 +594,13 @@ private:
         auto beacon_due = [&]() {
             return BEACON_INTERVAL_MS * (70 + (int64_t)(gen() % 61)) / 100;
         };
-        int64_t last_id_air_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
-        int64_t beacon_anchor_ms = last_id_air_ms;
+
+        int64_t last_id_air_ms = steady_now_ms() - HEARD_EXPIRY_MS - 1;
+        int64_t beacon_anchor_ms = steady_now_ms() - BEACON_INTERVAL_MS / 2;
         int64_t beacon_due_ms = beacon_due();
         int64_t tx_start_ms = steady_now_ms();
+
+        
 
         while (tx_running_ && g_running) {
             TxPacket pkt;
@@ -686,8 +689,10 @@ private:
                         gcfg.quiet_ms = RANKED_QUIET_MS;
                         gcfg.contenders = 0;
                         gcfg.slot_ms = 500;
-                        gcfg.extra_delay_ms = std::max(4, known_others() + 1) *
-                                              CsmaGate::RANKED_SLOT_MS;
+                        gcfg.dcd_detect_ms = 550;
+                        gcfg.extra_delay_ms =
+                            std::min(7, std::max(4, known_others() + 1)) *
+                            CsmaGate::RANKED_SLOT_MS;
                     }
                     int boot_rank = -1;
                     if (csma_ranked && csma_sync_only && !pkt.beacon) {
@@ -977,7 +982,8 @@ private:
     }
 
     int tx_lead_ms() const {
-        if (config_.tx_lead_tone && config_.tx_delay_ms >= 250)
+        if (config_.csma_enabled && config_.tx_lead_tone &&
+            config_.tx_delay_ms >= 250)
             return std::max(config_.tx_delay_ms,
                             ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS);
         return config_.tx_delay_ms;
@@ -1155,9 +1161,11 @@ private:
                 // Leading silence (TXDelay)
                 int lead_frames = tx_lead_ms() * config_.sample_rate / 1000;
                 if (beacon)
-                    lead_frames = (ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
+                    lead_frames = std::max(tx_lead_ms(),
+                                           ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
                                   config_.sample_rate / 1000;
-                if (beacon || (config_.tx_lead_tone && config_.tx_delay_ms >= 250)) {
+                if (beacon || (config_.csma_enabled && config_.tx_lead_tone &&
+                               config_.tx_delay_ms >= 250)) {
                     int gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
                                                         lead_frames - gap_frames,
@@ -1918,7 +1926,7 @@ private:
     std::atomic<uint16_t> station_id_{0};
     std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
-    static constexpr int64_t HEARD_EXPIRY_MS = 120000;
+    static constexpr int64_t HEARD_EXPIRY_MS = 150000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
     static constexpr int64_t BEACON_INTERVAL_MS = 45000;
@@ -2495,6 +2503,10 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             int v = atoi(value);
             if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
         }
+        else if (!strcmp(key, "tx_delay_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 250 && v <= 2500) config.tx_delay_ms = v;
+        }
         else if (!strcmp(key, "vox_lead_ms") && take(key)) {
             int v = atoi(value);
             if (v >= 50 && v <= 2000) config.vox_lead_ms = v;
@@ -3005,6 +3017,8 @@ int main(int argc, char** argv) {
                     config.vox_tone_freq = ui_state.vox_tone_freq;
                 if (!cli_set.count("vox_lead_ms"))
                     config.vox_lead_ms = ui_state.vox_lead_ms;
+                if (!cli_set.count("tx_delay_ms"))
+                    config.tx_delay_ms = ui_state.tx_delay_ms;
                 if (!cli_set.count("vox_tail_ms"))
                     config.vox_tail_ms = ui_state.vox_tail_ms;
 
@@ -3091,6 +3105,7 @@ int main(int argc, char** argv) {
                 ui_state.vox_tone_freq = config.vox_tone_freq;
                 ui_state.vox_lead_ms = config.vox_lead_ms;
                 ui_state.vox_tail_ms = config.vox_tail_ms;
+                ui_state.tx_delay_ms = config.tx_delay_ms;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
                 ui_state.com_ptt_line = config.com_ptt_line;
@@ -3187,6 +3202,7 @@ int main(int argc, char** argv) {
         ui_state.vox_tone_freq = config.vox_tone_freq;
         ui_state.vox_lead_ms = config.vox_lead_ms;
         ui_state.vox_tail_ms = config.vox_tail_ms;
+        ui_state.tx_delay_ms = config.tx_delay_ms;
         
 
 
@@ -3548,6 +3564,7 @@ int main(int argc, char** argv) {
                 new_config.vox_tone_freq = state.vox_tone_freq;
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
+                new_config.tx_delay_ms = state.tx_delay_ms;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
                 new_config.com_ptt_line = state.com_ptt_line;
