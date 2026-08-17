@@ -52,10 +52,16 @@ jobs:
         run: make -j"$(nproc)" VERSION="${{ steps.ver.outputs.version }}"
 
       - name: Smoke test
+        timeout-minutes: 8
+        env:
+          WINEDEBUG: -all
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq wine64 >/dev/null
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wine64
           file modem73.exe
-          timeout 30 wine modem73.exe --help
+          timeout -k 5 60 wine modem73.exe --help
+          # Don't let lingering wine background processes hold the step's log pipe open
+          command -v wineserver >/dev/null && { wineserver -k || true; wineserver -w || true; } || true
 
       - name: Package
         run: |
