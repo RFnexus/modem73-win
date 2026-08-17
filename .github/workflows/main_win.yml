@@ -57,8 +57,9 @@ jobs:
           WINEDEBUG: -all
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wine64
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wine
           file modem73.exe
+          command -v wine
           timeout -k 5 60 wine modem73.exe --help
           # Don't let lingering wine background processes hold the step's log pipe open
           command -v wineserver >/dev/null && { wineserver -k || true; wineserver -w || true; } || true
