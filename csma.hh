@@ -4,6 +4,32 @@
 #include <cstdint>
 #include <random>
 
+struct CsmaPreset {
+    const char* name;
+    int quiet_ms;
+    int cw;
+    int slot_ms;
+    int burst;
+    int dither;
+    bool lead_tone;
+};
+static const CsmaPreset CSMA_PRESETS[2][4] = {
+    {
+        {"BENCH",    0,  3, 500, 3, 0,    true},
+        {"RELAXED",  0,  8, 500, 3, 300,  true},
+        {"MODERATE", 0, 12, 500, 2, 800,  true},
+        {"BUSY",     0, 16, 500, 2, 1500, true},
+    },
+    {
+        {"BENCH",    0,  2, 200, 4, 0,   true},
+        {"RELAXED",  0,  4, 200, 4, 200, true},
+        {"MODERATE", 0,  6, 200, 3, 300, true},
+        {"BUSY",     0, 10, 200, 2, 500, true},
+    },
+};
+static const char* CSMA_BAND_NAMES[2] = {"HF", "VHF/UHF"};
+static constexpr int CSMA_PRESET_COUNT = 4;
+
 struct CsmaConfig {
     float threshold_db = -30.0f;
     bool sync_only = false;
@@ -22,24 +48,26 @@ struct CsmaConfig {
     int contenders = -1;
     int rank = -1;
     int rank_n = 0;
+    int extra_delay_ms = 0;
 };
 
 class CsmaGate {
 public:
     enum class Verdict { WAIT, TRANSMIT };
     enum class Reason { NONE, CLEAR, RESPONDER, BUSY_OVERRIDE, NO_AUDIO };
+    static constexpr int RANKED_SLOT_MS = 1500;
 
     CsmaGate(const CsmaConfig& cfg, uint32_t seed) : cfg_(cfg), gen_(seed) {
         int slot = std::max(1, cfg_.slot_ms);
         int window = std::max(2, cfg_.cw) * slot;
         if (cfg_.sync_only) {
             int det = std::max(1, cfg_.dcd_detect_ms);
-            if (cfg_.contenders >= 0 && cfg_.contenders <= 1)
-                window = std::max(4 * det, 4 * slot);
-            else if (cfg_.contenders == 2)
-                window = std::max(8 * det, 4 * slot);
-            else
+            if (cfg_.contenders >= 0) {
+                int slots = std::min(16, std::max(6, 3 * (cfg_.contenders + 1)));
+                window = std::max(slots * (det + 150), 4 * slot);
+            } else {
                 window = std::max(window * 2, 16 * det);
+            }
             if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms)
                 window = std::max(window / 4, 4 * slot);
         } else if (cfg_.idle_credit_ms >= cfg_.cold_channel_ms) {
@@ -47,8 +75,7 @@ public:
         }
         window_ = window;
         if (cfg_.sync_only && !cfg_.responder && cfg_.rank >= 0) {
-            int det = std::max(1, cfg_.dcd_detect_ms);
-            rank_slot_ = std::max(slot, det + 150);
+            rank_slot_ = RANKED_SLOT_MS;
             window_ = std::max(1, cfg_.rank_n) * rank_slot_;
             quiet_needed_ = cfg_.quiet_ms;
             contention_ms_ = cfg_.rank * rank_slot_;
@@ -60,7 +87,7 @@ public:
         } else {
             int slots = std::max(2, window / slot);
             quiet_needed_ = cfg_.quiet_ms;
-            contention_ms_ = slot *
+            contention_ms_ = cfg_.extra_delay_ms + slot *
                 std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
                 std::uniform_int_distribution<int>(0, slot - 1)(gen_);
         }
@@ -91,16 +118,18 @@ public:
             return Verdict::WAIT;
         }
         if (redraw_pending_ && cfg_.sync_only && !cfg_.responder) {
+            
+
             if (rank_slot_ > 0) {
                 contention_ms_ = cfg_.rank * rank_slot_;
             } else {
                 episodes_ = std::min(episodes_ + 1, 1);
                 int slot = std::max(1, cfg_.slot_ms);
-                int w = cfg_.contenders >= 0 && cfg_.contenders <= 1
+                int w = cfg_.contenders >= 0
                     ? window_
                     : (int)std::min<long long>((long long)window_ << episodes_, 60000);
                 int slots = std::max(2, w / slot);
-                contention_ms_ = slot *
+                contention_ms_ = cfg_.extra_delay_ms + slot *
                     std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
                     std::uniform_int_distribution<int>(0, slot - 1)(gen_);
             }
@@ -115,6 +144,7 @@ public:
             contention_ms_ -= cfg_.poll_ms;
             return Verdict::WAIT;
         }
+        
         reason_ = cfg_.responder ? Reason::RESPONDER : Reason::CLEAR;
         return Verdict::TRANSMIT;
     }
@@ -126,11 +156,7 @@ public:
             rank_slot_ = 0;
             return;
         }
-        if (rank_slot_ == 0) {
-            int slot = std::max(1, cfg_.slot_ms);
-            int det = std::max(1, cfg_.dcd_detect_ms);
-            rank_slot_ = std::max(slot, det + 150);
-        }
+        rank_slot_ = RANKED_SLOT_MS;
         window_ = std::max(1, cfg_.rank_n) * rank_slot_;
     }
 

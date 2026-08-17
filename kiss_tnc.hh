@@ -43,6 +43,19 @@ enum class PTTType {
 #endif
 };
 
+const std::vector<std::string> PTT_TYPE_OPTIONS = {
+    "NONE", "RIGCTL", "VOX", "COM"
+#ifdef WITH_CM108
+    , "CM108"
+#endif
+};
+
+const std::vector<std::string> PTT_LINE_OPTIONS = {
+    "DTR", "RTS", "BOTH"
+};
+
+
+
 struct TNCConfig {
     // Network settings
     std::string bind_address = "0.0.0.0";
@@ -105,8 +118,10 @@ struct TNCConfig {
     bool csma_enabled = true;
     float carrier_threshold_db = -30.0f;
     bool csma_sync_only = false;
-    bool csma_fast_floor = false;
+    bool csma_fast_floor = true;
     bool csma_ranked = false;
+    int beacon_interval_s = 45;
+    int csma_band = 0;
     int carrier_sense_ms = 100;
     int max_backoff_slots = 10;
     int csma_quiet_ms = 0;
@@ -426,6 +441,8 @@ struct TxPacket {
     std::vector<uint8_t> data;
     int oper_mode;  // -1 = use default mode
     int64_t enqueue_ms;
+    bool beacon = false;
+    bool manual = false;
     TxPacket() : oper_mode(-1), enqueue_ms(steady_now_ms()) {}
     TxPacket(std::vector<uint8_t> d, int mode = -1)
         : data(std::move(d)), oper_mode(mode), enqueue_ms(steady_now_ms()) {}
@@ -487,8 +504,10 @@ public:
         return fragments;
     }
     
+    // an unfragmented frame carries no header so a full MTU packet will fit in one
+    
     bool needs_fragmentation(size_t data_size, size_t max_payload) const {
-        return data_size > (max_payload - Frag::HEADER_SIZE);
+        return data_size > max_payload;
     }
     
 private:

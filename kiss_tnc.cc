@@ -48,9 +48,11 @@
 #endif
 
 std::atomic<bool> g_running{true};
+std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
+static bool g_tx_blanking_configured = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -241,7 +243,11 @@ public:
                                      "' (A-Z 0-9 / only, 1-9 characters)");
         }
         if (modem_config_.oper_mode < 0) {
-            throw std::runtime_error("Invalid modulation or code rate");
+            throw std::runtime_error("Unsupported OFDM combination: " + config.modulation +
+                                     " " + config.code_rate + " " +
+                                     ModemConfig::frame_size_name(config.frame_size) +
+                                     " (micro needs QPSK 1/2; the x2 rates and long frames"
+                                     " do not reach the higher QAM orders)");
         }
 
         if (config.modem_type == 1) {
@@ -260,7 +266,7 @@ public:
                                              config_.sample_rate);
         audio_->set_log_sink([](const std::string& msg) { ui_log(msg); });
         if (!audio_->open_playback()) {
-            throw std::runtime_error("Failed to open audio input");
+            throw std::runtime_error("Failed to open audio output");
         }
         if (!audio_->open_capture()) {
             throw std::runtime_error("Failed to open audio capture");
@@ -305,14 +311,21 @@ public:
         
         std::cerr << "KISS TNC listening on " << config_.bind_address << ":" << config_.port << std::endl;
         std::cerr << "Callsign: " << config_.callsign << std::endl;
-        std::cerr << "Modulation: " << config_.modulation << " " << config_.code_rate
-                  << " " << ModemConfig::frame_size_name(config_.frame_size) << std::endl;
+        if (config_.modem_type == 1) {
+            std::cerr << "Mode: MFSK " << MFSK_MODE_NAMES[config_.mfsk_mode] << std::endl;
+        } else if (config_.modem_type == 2) {
+            std::cerr << "Mode: ROBUST " << ROBUST_MODE_NAMES[config_.robust_mode] << std::endl;
+        } else {
+            std::cerr << "Mode: OFDM " << config_.modulation << " " << config_.code_rate
+                      << " " << ModemConfig::frame_size_name(config_.frame_size) << std::endl;
+        }
         std::cerr << "Payload: " << payload_size_ << " bytes (including 2-byte length prefix)" << std::endl;
-        
+
         if (config_.csma_enabled) {
             std::cerr << "CSMA: enabled ("
-                      << (config_.csma_sync_only ? "sync-only, " : "")
-                      << "threshold=" << config_.carrier_threshold_db
+                      << "mode=" << (!config_.csma_sync_only ? "threshold"
+                          : config_.csma_ranked ? "ranked" : "sync")
+                      << ", threshold=" << config_.carrier_threshold_db
                       << " dB, slot=" << config_.slot_time_ms
                       << " ms, cw=" << config_.csma_cw
                       << ", quiet=" << (config_.csma_quiet_ms > 0
@@ -533,37 +546,30 @@ private:
         } else {
             std::lock_guard<std::mutex> lock(config_mutex_);
             switch (cmd) {
+                // unused handled by modem73 config
             case KISS::CMD_TXDELAY:
                 if (!data.empty()) {
-                    config_.tx_delay_ms = data[0] * 10;
-                    ui_log("TXDelay set to " + std::to_string(config_.tx_delay_ms) + " ms");
+                    //
                 }
                 break;
             case KISS::CMD_P:
                 if (!data.empty()) {
-                    ui_log("KISS P-persistence " + std::to_string(data[0]) +
-                           " ignored (unused)");
+                    // 
                 }
                 break;
             case KISS::CMD_SLOTTIME:
                 if (!data.empty()) {
-                    int prev = config_.slot_time_ms;
-                    config_.slot_time_ms = data[0] * 10;
-                    ui_log("KISS client set slot time to " +
-                           std::to_string(config_.slot_time_ms) + " ms (was " +
-                           std::to_string(prev) + " ms)");
+                    //
                 }
                 break;
             case KISS::CMD_TXTAIL:
                 if (!data.empty()) {
-                    config_.ptt_tail_ms = data[0] * 10;
-                    ui_log("TXTail set to " + std::to_string(config_.ptt_tail_ms) + " ms");
+                    //
                 }
                 break;
             case KISS::CMD_FULLDUPLEX:
                 if (!data.empty()) {
-                    config_.full_duplex = data[0] != 0;
-                    ui_log(std::string("Full duplex ") + (config_.full_duplex ? "enabled" : "disabled"));
+                    ui_log("KISS full duplex request ignored");
                 }
                 break;
             case KISS::CMD_SETHW:
@@ -589,8 +595,21 @@ private:
         int csma_stage = 0;
         int csma_clean = 0;
         int boot_attempt = 0;
-        bool last_tx_responder = false;
-        int64_t last_burst_end = -1000000;
+        int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
+        auto beacon_interval_ms = [&]() {
+            std::lock_guard<std::mutex> lock(config_mutex_);
+            return (int64_t)config_.beacon_interval_s * 1000;
+        };
+        auto beacon_due = [&]() {
+            return beacon_interval_ms() * (70 + (int64_t)(gen() % 61)) / 100;
+        };
+
+        int64_t last_id_air_ms = steady_now_ms() - HEARD_EXPIRY_MS - 1;
+        int64_t beacon_anchor_ms = steady_now_ms() - beacon_interval_ms() / 2;
+        int64_t beacon_due_ms = beacon_due();
+        int64_t tx_start_ms = steady_now_ms();
+
+        
 
         while (tx_running_ && g_running) {
             TxPacket pkt;
@@ -600,9 +619,25 @@ private:
                     g_ui_state->tx_queue_size = tx_queue_.size();
                 }
 #endif
+                if (pkt.beacon) {
+                    bool still_want;
+                    {
+                        std::lock_guard<std::mutex> lock(config_mutex_);
+                        still_want = config_.csma_enabled && config_.csma_sync_only &&
+                                     ranked_active();
+                    }
+                    bool drop = pkt.manual
+                        ? !tx_queue_.empty()
+                        : (!still_want || !tx_queue_.empty() || !is_tx_allowed());
+                    if (drop) {
+                        beacon_anchor_ms = steady_now_ms();
+                        beacon_due_ms = beacon_due();
+                        continue;
+                    }
+                }
                 // CSMA
                 bool csma_enabled, csma_sync_only, csma_fast_floor, csma_ranked;
-                bool this_tx_responder = false;
+                int csma_band;
                 int carrier_sense_ms, slot_time_ms, csma_quiet_ms, csma_cw, csma_dither, csma_burst, modem_type;
                 float carrier_threshold_db;
                 std::string csma_callsign;
@@ -611,8 +646,8 @@ private:
                     csma_enabled = config_.csma_enabled;
                     csma_sync_only = config_.csma_sync_only;
                     csma_fast_floor = config_.csma_fast_floor;
-                    csma_ranked = config_.csma_ranked && config_.tx_lead_tone &&
-                                  config_.tx_delay_ms >= 250;
+                    csma_band = config_.csma_band;
+                    csma_ranked = ranked_active();
                     carrier_sense_ms = config_.carrier_sense_ms;
                     carrier_threshold_db = config_.carrier_threshold_db;
                     slot_time_ms = config_.slot_time_ms;
@@ -625,7 +660,7 @@ private:
                     if (config_.modem_type == 0) {
                         bool short_ofdm = pkt.oper_mode >= 0
                             ? (pkt.oper_mode & 1) == 0
-                            : config_.frame_size == 0;
+                            : (config_.frame_size == 0 || config_.frame_size == 3);
                         if (short_ofdm) {
                             slot_time_ms = std::min(slot_time_ms, 300);
                             csma_burst = 4;
@@ -650,46 +685,70 @@ private:
                     gcfg.slot_ms = slot_time_ms;
                     gcfg.dcd_detect_ms = csma_fast_floor ? 550
                                        : modem_type == 2 ? 780 : 1310;
-                    gcfg.contenders = csma_sync_only ? n_contenders() : -1;
+                    gcfg.contenders = csma_sync_only
+                                        ? n_contenders(csma_band == 0) : -1;
                     int raw_pop = gcfg.contenders;
-                    if (occupancy_pct_.load() > 55 || csma_stage >= 1 ||
-                        gcfg.contenders > 1)
+                    if (occupancy_pct_.load() > 55 || csma_stage >= 1)
                         gcfg.contenders = -1;
                     if (steady_now_ms() - last_burst_end < 3000 &&
                         gcfg.contenders >= 0 && gcfg.contenders <= 1)
                         gcfg.contenders = 2;
-                    if (gcfg.contenders >= 0)
-                        gcfg.dcd_detect_ms = 550;
                     if (csma_sync_only && csma_quiet_ms <= 0 &&
                         gcfg.contenders >= 0 && gcfg.contenders <= 1)
                         gcfg.quiet_ms = std::min(gcfg.quiet_ms, 1000);
+                    if (pkt.beacon) {
+                        gcfg.quiet_ms = RANKED_QUIET_MS;
+                        gcfg.contenders = 0;
+                        gcfg.slot_ms = 500;
+                        gcfg.dcd_detect_ms = 550;
+                        gcfg.extra_delay_ms =
+                            std::min(7, std::max(4, known_others() + 1)) *
+                            CsmaGate::RANKED_SLOT_MS;
+                    }
                     int boot_rank = -1;
-                    if (csma_ranked && csma_sync_only) {
-                        gcfg.rank = ranked_slot(&gcfg.rank_n);
+                    if (csma_ranked && csma_sync_only && !pkt.beacon) {
+                        gcfg.quiet_ms = RANKED_QUIET_MS;
+                        bool forgotten =
+                            steady_now_ms() - last_id_air_ms > HEARD_EXPIRY_MS;
+                        gcfg.rank = forgotten ? -1 : ranked_slot(&gcfg.rank_n);
+                        if (gcfg.rank >= gcfg.rank_n)
+                            yield_attempt_++;
                         if (gcfg.rank < 0) {
-                            uint32_t h = (uint32_t)station_id_.load() ^
-                                         (uint32_t)(boot_attempt * 0x9E37u);
-                            h *= 0x9E3779B1u;
-                            h ^= h >> 16;
-                            h *= 0x85EBCA6Bu;
-                            h ^= h >> 13;
-                            boot_rank = (int)(h % 4);
-                            boot_attempt++;
-                            gcfg.rank = boot_rank;
-                            gcfg.rank_n = 4;
+                            if (forgotten) {
+                                boot_rank = (int)(id_mix(station_id_.load(),
+                                                         boot_attempt) % 4);
+                                boot_attempt++;
+                            }
+                            int known = known_others();
+                            if (boot_rank >= 0 && known > 0) {
+                                gcfg.rank = std::max(4, known + 1) + boot_rank;
+                                gcfg.rank_n = gcfg.rank + 1;
+                                if (g_debug)
+                                    ui_log("CSMA: silent too long, entering "
+                                           "after known turns");
+                            } else {
+                                gcfg.rank_n = 0;
+                            }
                         } else {
                             boot_attempt = 0;
                         }
                     }
                     if (g_debug && csma_sync_only) {
                         char dbg[128];
+                        char rankbuf[24];
+                        if (gcfg.rank < 0)
+                            snprintf(rankbuf, sizeof rankbuf, "none");
+                        else if (gcfg.rank >= gcfg.rank_n)
+                            snprintf(rankbuf, sizeof rankbuf, "yield/%d", gcfg.rank_n);
+                        else
+                            snprintf(rankbuf, sizeof rankbuf, "%d/%d",
+                                     gcfg.rank, gcfg.rank_n);
                         snprintf(dbg, sizeof dbg,
                                  "CSMA: pop %d stage %d occupancy %d%% "
-                                 "quiet %d ms rank %d/%d winner %04X",
+                                 "quiet %d ms rank %s winner %04X",
                                  raw_pop, csma_stage,
                                  occupancy_pct_.load(), gcfg.quiet_ms,
-                                 gcfg.rank, gcfg.rank_n,
-                                 last_winner_id_.load());
+                                 rankbuf, last_winner_id_.load());
                         ui_log(dbg);
                     }
                     gcfg.busy_limit_ms = std::max(30000, 8 * channel_air_ms());
@@ -705,16 +764,11 @@ private:
                         gcfg.responder_dither_ms = (int)(hash % (uint32_t)csma_dither);
                     }
                     int64_t rx_ms = last_rx_done_ms_.load();
-                    gcfg.responder = rx_ms > 0 && pkt.enqueue_ms >= rx_ms &&
+                    gcfg.responder = !pkt.beacon && !(csma_ranked && csma_sync_only) &&
+                                     rx_ms > 0 &&
+                                     pkt.enqueue_ms >= rx_ms &&
                                      pkt.enqueue_ms - rx_ms <= 5000 &&
                                      steady_now_ms() - rx_ms <= 8000;
-                    if (gcfg.responder && csma_ranked && csma_sync_only &&
-                        last_tx_responder && known_others() >= 2) {
-                        gcfg.responder = false;
-                        if (g_debug)
-                            ui_log("CSMA: responder cap, taking ranked turn");
-                    }
-                    this_tx_responder = gcfg.responder;
                     CsmaGate gate(gcfg, (uint32_t)gen());
 #ifdef WITH_UI
                     if (g_ui_state) g_ui_state->csma_window_ms = gate.window_ms();
@@ -732,15 +786,27 @@ private:
                     bool was_busy = false, was_deaf = false, quiet_logged = false;
                     int busy_episodes = 0;
                     int cur_rank = -1, cur_rank_n = 0;
+                    bool beacon_yield = false;
                     while (g_running) {
+                        if (pkt.beacon && !tx_queue_.empty()) {
+                            beacon_yield = true;
+                            break;
+                        }
                         bool alive = audio_->capture_alive();
                         float level_db = audio_->instant_level_db(carrier_sense_ms);
                         bool allowed = is_tx_allowed();
                         if (csma_ranked && csma_sync_only) {
-                            cur_rank = ranked_slot(&cur_rank_n);
-                            if (cur_rank < 0 && boot_rank >= 0) {
-                                cur_rank = boot_rank;
-                                cur_rank_n = 4;
+                            if (boot_rank >= 0) {
+                                int known = known_others();
+                                if (known > 0) {
+                                    cur_rank = std::max(4, known + 1) + boot_rank;
+                                    cur_rank_n = cur_rank + 1;
+                                } else {
+                                    cur_rank = -1;
+                                    cur_rank_n = 0;
+                                }
+                            } else {
+                                cur_rank = ranked_slot(&cur_rank_n);
                             }
                             gate.set_rank(cur_rank, cur_rank_n);
                         }
@@ -805,6 +871,14 @@ private:
 #endif
                         std::this_thread::sleep_for(std::chrono::milliseconds(gcfg.poll_ms));
                     }
+                    if (beacon_yield) {
+#ifdef WITH_UI
+                        if (g_ui_state) g_ui_state->csma_phase = 0;
+#endif
+                        beacon_anchor_ms = steady_now_ms();
+                        beacon_due_ms = beacon_due();
+                        continue;
+                    }
                     if (csma_sync_only) {
                         if (busy_episodes >= 2) {
                             csma_stage = std::min(csma_stage + 2, 2);
@@ -823,7 +897,7 @@ private:
 #endif
                 TxPacket cur = std::move(pkt);
                 bool first = true;
-                int remaining = csma_burst - 1;
+                int remaining = cur.beacon ? 0 : csma_burst - 1;
                 while (true) {
                     TxPacket next;
                     bool have_next = remaining > 0 && tx_queue_.pop(next);
@@ -832,11 +906,15 @@ private:
                         g_ui_state->tx_queue_size = tx_queue_.size();
                     }
 #endif
-                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next);
+                    bool sent = transmit(cur.data, cur.oper_mode, first, !have_next,
+                                         cur.beacon);
                     if (!have_next) {
-                        last_burst_end = steady_now_ms();
+                        if (!cur.beacon)
+                            last_burst_end = steady_now_ms();
                         if (sent) {
-                            last_tx_responder = this_tx_responder;
+                            last_id_air_ms = steady_now_ms();
+                            beacon_anchor_ms = last_id_air_ms;
+                            beacon_due_ms = beacon_due();
                             if (csma_ranked)
                                 last_winner_id_.store(station_id_.load());
                         }
@@ -850,11 +928,34 @@ private:
                     --remaining;
                 }
             } else {
+                int64_t bnow = steady_now_ms();
+                if (bnow - beacon_anchor_ms >= beacon_due_ms) {
+                    bool want;
+                    {
+                        std::lock_guard<std::mutex> lock(config_mutex_);
+                        want = config_.csma_enabled && config_.csma_sync_only &&
+                               ranked_active();
+                    }
+                    bool participating =
+                        bnow - last_burst_end < PARTICIPATION_MS ||
+                        bnow - tx_start_ms < PARTICIPATION_MS ||
+                        !tx_queue_.empty();
+                    if (!participating)
+                        want = false;
+                    if (want) {
+                        TxPacket b;
+                        b.beacon = true;
+                        tx_queue_.push(std::move(b));
+                    } else {
+                        beacon_anchor_ms = bnow;
+                        beacon_due_ms = beacon_due();
+                    }
+                }
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
             }
         }
     }
-    
+
     int frame_air_ms() {
         int ps = payload_size_.load();
         uint64_t key = ((uint64_t)config_.modem_type << 48) ^
@@ -900,21 +1001,30 @@ private:
         return q;
     }
 
+    bool ranked_active() const {
+        return config_.csma_ranked && config_.tx_lead_tone &&
+               (config_.ptt_type == PTTType::VOX ||
+                config_.tx_delay_ms >= 250);
+    }
+
     int tx_lead_ms() const {
-        if (config_.tx_lead_tone && config_.tx_delay_ms >= 250)
+        if (config_.csma_enabled && config_.tx_lead_tone &&
+            config_.tx_delay_ms >= 250)
             return std::max(config_.tx_delay_ms,
                             ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS);
         return config_.tx_delay_ms;
     }
 
     bool transmit(const std::vector<uint8_t>& data, int oper_mode_override = -1,
-                  bool first = true, bool last = true) {
+                  bool first = true, bool last = true, bool beacon = false) {
         while (alc_tune_active_.load() && g_running)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         tx_on_air_ = true;
         int tx_mode = (oper_mode_override >= 0) ? oper_mode_override : modem_config_.oper_mode;
 
-        if (oper_mode_override >= 0) {
+        if (beacon) {
+            ui_log("TX: presence tone");
+        } else if (oper_mode_override >= 0) {
             ui_log("TX: " + std::to_string(data.size()) + " bytes (mode override)");
         } else {
             ui_log("TX: " + std::to_string(data.size()) + " bytes");
@@ -928,7 +1038,7 @@ private:
         }
 
 #ifdef WITH_UI
-        if (g_ui_state) {
+        if (g_ui_state && !beacon) {
             g_ui_state->transmitting = true;
             g_ui_state->tx_frame_count++;
             std::string mname = config_.modem_type == 2
@@ -947,7 +1057,9 @@ private:
 
         // Encode to audio
         std::vector<float> samples;
-        if (config_.modem_type == 1) {
+        if (beacon) {
+            // tone only, no data frame
+        } else if (config_.modem_type == 1) {
             samples = mfsk_encoder_->encode(
                 framed_data.data(), framed_data.size(),
                 modem_config_.center_freq,
@@ -973,7 +1085,7 @@ private:
             );
         }
         
-        if (samples.empty()) {
+        if (samples.empty() && !beacon) {
             ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
@@ -1007,33 +1119,61 @@ private:
         if (config_.ptt_type == PTTType::VOX) {
             // VOX mode: generate tone to trigger radio's VOX
             int lead_samples = config_.vox_lead_ms * config_.sample_rate / 1000;
-            int tail_samples = config_.vox_tail_ms * config_.sample_rate / 1000;
-            
-            // Generate lead tone
-            auto lead_tone = generate_tone(config_.vox_tone_freq, lead_samples, 0.8f);
-            
-            // Generate tail tone  
+            int tail_ms = beacon ? 0 : config_.vox_tail_ms;
+            int tail_samples = tail_ms * config_.sample_rate / 1000;
+
+            bool sig_lead = first &&
+                            (beacon || (config_.csma_enabled &&
+                                        config_.tx_lead_tone));
+            int sig_lead_ms = ToneDCD::MIN_LEAD_MS +
+                              std::max(0, config_.vox_lead_ms - 150);
+            int gap_frames = 0;
+            std::vector<float> lead_tone;
+            if (sig_lead) {
+                if (!beacon) {
+                    gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
+                }
+                lead_tone = ToneDCD::signature_lead(
+                    modem_config_.center_freq,
+                    sig_lead_ms * config_.sample_rate / 1000,
+                    ToneDCD::LEAD_AMPLITUDE, config_.sample_rate,
+                    station_id_);
+            } else {
+                lead_tone = generate_tone(config_.vox_tone_freq, lead_samples, 0.8f);
+            }
+
+            // Generate tail tone
             auto tail_tone = generate_tone(config_.vox_tone_freq, tail_samples, 0.8f);
-            
-            total_tx_duration += (config_.vox_lead_ms + config_.vox_tail_ms) / 1000.0f;
-            
-            ui_log("TX: VOX mode, " + std::to_string(config_.vox_tone_freq) + "Hz tone, " +
-                   std::to_string(config_.vox_lead_ms) + "ms lead, " +
-                   std::to_string(config_.vox_tail_ms) + "ms tail");
-            
+
+            total_tx_duration += (sig_lead ? sig_lead_ms
+                                           : config_.vox_lead_ms) / 1000.0f +
+                                 (gap_frames + tail_samples) /
+                                     (float)config_.sample_rate;
+
+            if (sig_lead)
+                ui_log("TX: VOX mode, signature lead " +
+                       std::to_string(sig_lead_ms) + "ms, " +
+                       std::to_string(tail_ms) + "ms tail");
+            else
+                ui_log("TX: VOX mode, " + std::to_string(config_.vox_tone_freq) + "Hz tone, " +
+                       std::to_string(config_.vox_lead_ms) + "ms lead, " +
+                       std::to_string(tail_ms) + "ms tail");
+
 #ifdef WITH_UI
             if (g_ui_state) g_ui_state->ptt_on = true;
 #endif
-            
+
             // Transmit: lead tone -> OFDM data -> tail tone
             const int chunk_size = 1024;
-            
+
             // Lead tone
             for (size_t i = 0; i < lead_tone.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(lead_tone.size() - i));
                 audio_->write(lead_tone.data() + i, n);
             }
-            
+            if (gap_frames > 0)
+                audio_->write_silence(gap_frames);
+
             // OFDM data
             for (size_t i = 0; i < samples.size(); i += chunk_size) {
                 int n = std::min(chunk_size, (int)(samples.size() - i));
@@ -1074,7 +1214,12 @@ private:
 
                 // Leading silence (TXDelay)
                 int lead_frames = tx_lead_ms() * config_.sample_rate / 1000;
-                if (config_.tx_lead_tone && config_.tx_delay_ms >= 250) {
+                if (beacon)
+                    lead_frames = std::max(tx_lead_ms(),
+                                           ToneDCD::MIN_LEAD_MS + TONE_LEAD_GAP_MS) *
+                                  config_.sample_rate / 1000;
+                if (beacon || (config_.csma_enabled && config_.tx_lead_tone &&
+                               config_.tx_delay_ms >= 250)) {
                     int gap_frames = TONE_LEAD_GAP_MS * config_.sample_rate / 1000;
                     auto lead = ToneDCD::signature_lead(modem_config_.center_freq,
                                                         lead_frames - gap_frames,
@@ -1835,6 +1980,12 @@ private:
     std::atomic<uint16_t> station_id_{0};
     std::atomic<uint16_t> last_winner_id_{0};
     std::mutex heard_mutex_;
+    static constexpr int64_t HEARD_EXPIRY_MS = 300000;
+    static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
+    static constexpr int RANKED_QUIET_MS = 1000;
+    static constexpr int YIELD_BUCKETS = 4;
+    static constexpr int64_t PARTICIPATION_MS = 1200000;
+    int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
     int64_t last_id_ms_ = -1000000;
     int64_t last_dcd_ms_ = -1000000;
@@ -1842,13 +1993,14 @@ private:
     int64_t unattrib_seen_ms_ = -1000000;
     std::atomic<int64_t> last_unattrib_ms_{-1000000};
 
-    int n_contenders() {
+    int n_contenders(bool keep_on_stray = false) {
         int64_t now = steady_now_ms();
-        if (now - last_unattrib_ms_.load() <= 90000)
+        if (!keep_on_stray &&
+            now - last_unattrib_ms_.load() <= UNATTRIB_DISTRUST_MS)
             return -1;
         std::lock_guard<std::mutex> hl(heard_mutex_);
         for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
-            if (now - it->second > 90000)
+            if (now - it->second > HEARD_EXPIRY_MS)
                 it = heard_ids_.erase(it);
             else
                 ++it;
@@ -1861,7 +2013,7 @@ private:
         std::lock_guard<std::mutex> hl(heard_mutex_);
         int c = 0;
         for (const auto& kv : heard_ids_)
-            if (now - kv.second <= 90000)
+            if (now - kv.second <= HEARD_EXPIRY_MS)
                 c++;
         return c;
     }
@@ -1870,7 +2022,7 @@ private:
         int64_t now = steady_now_ms();
         std::lock_guard<std::mutex> hl(heard_mutex_);
         for (auto it = heard_ids_.begin(); it != heard_ids_.end();) {
-            if (now - it->second > 90000)
+            if (now - it->second > HEARD_EXPIRY_MS)
                 it = heard_ids_.erase(it);
             else
                 ++it;
@@ -1891,10 +2043,20 @@ private:
         if (w == ids.end())
             return i;
         if (*w == self) {
-            *n_out = 2 * n - 1;
-            return n - 1 + i;
+            *n_out = n;
+            return n - 1 + (int)(id_mix(self, yield_attempt_) % YIELD_BUCKETS);
         }
+        yield_attempt_ = 0;
         return (i - (int)(w - ids.begin()) - 1 + n) % n;
+    }
+
+    static uint32_t id_mix(uint16_t id, int attempt) {
+        uint32_t h = (uint32_t)id ^ (uint32_t)(attempt * 0x9E37u);
+        h *= 0x9E3779B1u;
+        h ^= h >> 16;
+        h *= 0x85EBCA6Bu;
+        h ^= h >> 13;
+        return h;
     }
     float occupancy_ema_ = 0.0f;
     float occupancy_other_ema_ = 0.0f;
@@ -2014,6 +2176,8 @@ public:
             config_.csma_sync_only = new_config.csma_sync_only;
             config_.csma_fast_floor = new_config.csma_fast_floor;
             config_.csma_ranked = new_config.csma_ranked;
+            config_.beacon_interval_s = new_config.beacon_interval_s;
+            config_.csma_band = new_config.csma_band;
             config_.postamble = new_config.postamble;
             config_.carrier_threshold_db = new_config.carrier_threshold_db;
             config_.p_persistence = new_config.p_persistence;
@@ -2213,9 +2377,23 @@ public:
 
     bool is_transmitting() const { return tx_blanking_active_.load(); }
 
+    void unkey() {
+        set_ptt(false);
+        tx_on_air_ = false;
+        tx_blanking_active_ = false;
+    }
+
     size_t tx_queue_depth() const { return tx_queue_.size(); }
 
     int channel_population() { return known_others(); }
+
+    bool queue_beacon() {
+        TxPacket b;
+        b.beacon = true;
+        b.manual = true;
+        tx_queue_.push(std::move(b));
+        return true;
+    }
 
     int channel_occupancy() const { return occupancy_pct_.load(); }
 
@@ -2301,16 +2479,19 @@ public:
     }
 };
 
+static const char* const MOD_OPTS[] = {
+    "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
+};
+static const int N_MOD = sizeof(MOD_OPTS) / sizeof(*MOD_OPTS);
+static const char* const RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"};
+static const int N_RATE = sizeof(RATE_OPTS) / sizeof(*RATE_OPTS);
+static const char* const MODEM_TYPE_OPTS[] = {"ofdm", "mfsk", "robust"};
+static const char* const CSMA_MODE_OPTS[] = {"threshold", "sync", "ranked"};
+static const char* const CSMA_BAND_OPTS[] = {"hf", "vhf"};
+
 // Load key=value settings from path into config when --config is passed
 static bool apply_settings_file(const std::string& path, TNCConfig& config,
                                 const std::set<std::string>& cli_set) {
-    static const char* MOD_OPTS[] = {
-        "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
-    };
-    static const int N_MOD = sizeof(MOD_OPTS) / sizeof(*MOD_OPTS);
-    static const char* RATE_OPTS[] = {"1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"};
-    static const int N_RATE = sizeof(RATE_OPTS) / sizeof(*RATE_OPTS);
-
     FILE* f = fopen(path.c_str(), "r");
     if (!f) return false;
 
@@ -2349,7 +2530,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "short_frame") && take("frame_size")) config.frame_size = atoi(value) != 0 ? 0 : 1;
         else if (!strcmp(key, "frame_size") && take(key)) {
             int v = atoi(value);
-            if (v >= 0 && v <= 2) config.frame_size = v;
+            if (v >= 0 && v <= 3) config.frame_size = v;
         }
         else if (!strcmp(key, "center_freq") && take(key)) config.center_freq = 1500;
         else if (!strcmp(key, "rx_filter_enabled") && take(key)) config.rx_filter_enabled = atoi(value) != 0;
@@ -2361,7 +2542,12 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "csma_sync_only") && take(key)) config.csma_sync_only = atoi(value) != 0;
         else if (!strcmp(key, "csma_fast_floor") && take(key)) config.csma_fast_floor = atoi(value) != 0;
         else if (!strcmp(key, "csma_ranked") && take(key)) config.csma_ranked = atoi(value) != 0;
-        else if (!strcmp(key, "carrier_threshold_db") && take(key)) config.carrier_threshold_db = atof(value);
+        else if (!strcmp(key, "csma_band") && take(key)) config.csma_band = atoi(value) != 0 ? 1 : 0;
+        else if (!strcmp(key, "carrier_threshold_db") && take(key)) {
+            float v = atof(value);
+            if (std::isfinite(v) && v >= -80.0f && v <= 0.0f)
+                config.carrier_threshold_db = v;
+        }
         else if (!strcmp(key, "slot_time_ms") && take(key)) config.slot_time_ms = atoi(value);
         else if (!strcmp(key, "csma_quiet_ms") && take(key)) config.csma_quiet_ms = atoi(value);
         else if (!strcmp(key, "csma_cw") && take(key)) config.csma_cw = atoi(value);
@@ -2370,7 +2556,14 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
-        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
+        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) {
+            config.tx_blanking_enabled = atoi(value) != 0;
+            g_tx_blanking_configured = true;
+        }
+        else if (!strcmp(key, "tx_drive") && take(key)) {
+            float v = (float)atof(value);
+            if (std::isfinite(v) && v >= 0.05f && v <= 1.0f) config.tx_drive = v;
+        }
         else if (!strcmp(key, "audio_input") && take(key)) config.audio_input_device = value;
         else if (!strcmp(key, "audio_output") && take(key)) config.audio_output_device = value;
         else if (!strcmp(key, "audio_device")) {
@@ -2378,18 +2571,41 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (take("audio_output")) config.audio_output_device = value;
         }
         else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(atoi(value));
-        else if (!strcmp(key, "vox_tone_freq") && take(key)) config.vox_tone_freq = atoi(value);
-        else if (!strcmp(key, "vox_lead_ms") && take(key)) config.vox_lead_ms = atoi(value);
-        else if (!strcmp(key, "vox_tail_ms") && take(key)) config.vox_tail_ms = atoi(value);
+        else if (!strcmp(key, "vox_tone_freq") && take(key)) {
+            int v = atoi(value);
+            if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
+        }
+        else if (!strcmp(key, "tx_delay_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 250 && v <= 2500) config.tx_delay_ms = v;
+        }
+        else if (!strcmp(key, "beacon_interval_s") && take(key)) {
+            int v = atoi(value);
+            if (v >= 45 && v <= 90) config.beacon_interval_s = v;
+        }
+        else if (!strcmp(key, "vox_lead_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) config.vox_lead_ms = v;
+        }
+        else if (!strcmp(key, "vox_tail_ms") && take(key)) {
+            int v = atoi(value);
+            if (v >= 50 && v <= 2000) config.vox_tail_ms = v;
+        }
         else if (!strcmp(key, "com_port") && take(key)) config.com_port = value;
-        else if (!strcmp(key, "com_ptt_line") && take(key)) config.com_ptt_line = atoi(value);
+        else if (!strcmp(key, "com_ptt_line") && take(key)) {
+            int v = atoi(value);
+            if (v >= 0 && v <= 2) config.com_ptt_line = v;
+        }
         else if (!strcmp(key, "com_invert_dtr") && take(key)) config.com_invert_dtr = atoi(value) != 0;
         else if (!strcmp(key, "com_invert_rts") && take(key)) config.com_invert_rts = atoi(value) != 0;
 #ifdef WITH_CM108
         else if (!strcmp(key, "cm108_gpio") && take(key)) config.cm108_gpio = atoi(value);
         else if (!strcmp(key, "cm108_device") && take(key)) config.cm108_device = value;
 #endif
-        else if (!strcmp(key, "port") && take(key)) config.port = atoi(value);
+        else if (!strcmp(key, "port") && take(key)) {
+            int v = atoi(value);
+            if (v >= 1 && v <= 65535) config.port = v;
+        }
         else if (!strcmp(key, "bind_address") && take(key)) config.bind_address = value;
         else if (!strcmp(key, "control_bind_address") && take(key)) config.control_bind_address = value;
     }
@@ -2398,79 +2614,153 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
     return true;
 }
 
+static bool arg_ieq(const std::string& a, const char* b) {
+    size_t i = 0;
+    for (; i < a.size() && b[i]; ++i)
+        if (toupper((unsigned char)a[i]) != toupper((unsigned char)b[i]))
+            return false;
+    return i == a.size() && b[i] == '\0';
+}
+
+template<typename T, size_t N>
+static int arg_index(const std::string& value, T (&names)[N]) {
+    for (size_t i = 0; i < N; ++i)
+        if (arg_ieq(value, names[i])) return (int)i;
+    return -1;
+}
+
+template<typename T, size_t N>
+static void print_arg_options(const char* flag, const std::string& value,
+                              T (&names)[N]) {
+    std::cerr << "Invalid " << flag << " '" << value << "', expected one of:";
+    for (size_t i = 0; i < N; ++i)
+        std::cerr << ' ' << names[i];
+    std::cerr << std::endl;
+}
+
+static int clamp_arg(const char* flag, const char* value, int lo, int hi) {
+    int v = std::atoi(value);
+    int c = std::min(hi, std::max(lo, v));
+    if (c != v)
+        std::cerr << "Warning: " << flag << ' ' << v << " out of range "
+                  << lo << ".." << hi << ", using " << c << std::endl;
+    return c;
+}
+
+static float clamp_arg_f(const char* flag, const char* value, float lo, float hi) {
+    float v = (float)std::atof(value);
+    if (!std::isfinite(v)) v = lo;
+    float c = std::min(hi, std::max(lo, v));
+    if (c != v)
+        std::cerr << "Warning: " << flag << ' ' << v << " out of range "
+                  << lo << ".." << hi << ", using " << c << std::endl;
+    return c;
+}
+
 void print_help(const char* prog) {
     std::cerr << "MODEM73\n\n"
-              << "Usage: " << prog << " [options]\n\n"
-              << "Options:\n"
+              << "Usage: " << prog << " [options]\n"
+              << "\nGeneral:\n"
+#ifdef WITH_UI
+              << "  -h, --headless          Run without the TUI\n"
+#endif
+              << "  -v, --verbose           Verbose output\n"
+              << "      --debug             Log heard station IDs and population tracking\n"
+              << "      --config [FILE]     Load options from FILE\n"
+              << "                          (defaults to %APPDATA%\\modem73\\settings)\n"
+              << "      --list-audio        List available audio devices and exit\n"
+#ifdef WITH_CM108
+              << "      --list-cm108        List CM108-compatible devices and exit\n"
+#endif
+              << "      --help              Show this help\n"
+              << "\nNetwork:\n"
               << "  -p, --port PORT         KISS TCP port (default: 8001)\n"
-              << "  --bind ADDR             KISS bind address (default: 0.0.0.0)\n"
-              << "  --control-port PORT     Control port (default: 8073, 0 to disable)\n"
-              << "  --control-bind ADDR     Control port bind address (default: 127.0.0.1)\n"
-              << "  -d, --device DEV        Audio device for both I/O\n"
-              << "  --input-device DEV      Audio input  device\n"
-              << "  --output-device DEV     Audio output device\n"
-              << "  --list-audio            List available audio devices and exit\n"
+              << "      --bind ADDR         KISS bind address (default: 0.0.0.0)\n"
+              << "      --control-port PORT Control port (default: 8073, 0 to disable)\n"
+              << "      --control-bind ADDR Control port bind address (default: 127.0.0.1)\n"
+              << "\nAudio:\n"
+              << "  -d, --device DEV        Audio device for both capture and playback\n"
+              << "      --input-device DEV  Audio capture device\n"
+              << "      --output-device DEV Audio playback device\n"
+              << "      --tx-level PCT      TX audio output level, 5-100 (default: 100)\n"
+              << "\nModem:\n"
               << "  -c, --callsign CALL     Callsign (default: N0CALL)\n"
-              << "  -m, --modulation MOD    BPSK/QPSK/8PSK/QAM16/QAM64/QAM256 (default: QPSK)\n"
-              << "  -r, --rate RATE         Code rate: 1/2, 2/3, 3/4, 5/6, 1/4 (default: 1/2)\n"
-              << "  --short                 Use short frames\n"
-              << "  --normal                Use normal frames (default)\n"
-              << "  --long                  Use long frames\n"
-              << "  --no-rxfilter           Disable RX bandpass in front of the OFDM decoder\n"
-              << "\nPTT options:\n"
-              << "  --ptt TYPE              PTT type: none, rigctl, vox, com"
+              << "      --modem TYPE        ofdm, mfsk or robust (default: ofdm)\n"
+              << "  -m, --modulation MOD    OFDM modulation, one of:\n"
+              << "                          BPSK QPSK 8PSK QAM16 QAM64 QAM256 QAM1024 QAM4096\n"
+              << "                          (default: QPSK)\n"
+              << "  -r, --rate RATE         OFDM code rate, one of:\n"
+              << "                          1/2 2/3 3/4 5/6 1/4 (default: 1/2)\n"
+              << "                          \n"
+              << "      --short             OFDM short frames\n"
+              << "      --normal            OFDM normal frames (default)\n"
+              << "      --long              OFDM long frames\n"
+              << "      --micro             OFDM QB micro burst (WIP)\n"
+              << "      --postamble         Send a postamble after each OFDM frame\n"
+              << "      --no-postamble      Do not send a postamble (default)\n"
+              << "      --mfsk-mode MODE    MFSK-8, MFSK-16, MFSK-32 or MFSK-32R\n"
+              << "                          (implies --modem mfsk)\n"
+              << "      --robust-mode MODE  RDM-1200 RDM-800 RDM-600 RDM-300 RDMN-300 RDMN-150\n"
+              << "                          suffix S selects short frames (e.g. RDM-600S),\n"
+              << "                          RDM-QB is the 32 B micro burst\n"
+              << "                          (implies --modem robust)\n"
+              << "      --no-rxfilter       Disable RX bandpass in front of the OFDM decoder\n"
+              << "\nRX decoders:\n"
+              << "      --no-mfsk-rx        Disable the 3 always-on MFSK RX decoders to save CPU\n"
+              << "                          (ignored while an MFSK mode is selected for TX)\n"
+              << "      --no-ofdm-rx        Disable the OFDM RX decoder to save CPU\n"
+              << "                          (ignored while an OFDM mode is selected for TX)\n"
+              << "      --no-robust-rx      Disable the 2 ROBUST (RDM) RX decoders to save CPU\n"
+              << "                          (ignored while a ROBUST mode is selected for TX)\n"
+              << "\nPTT:\n"
+              << "      --ptt TYPE          PTT type: none, rigctl, vox, com"
 #ifdef WITH_CM108
               << ", cm108"
 #endif
               << " (default: rigctl)\n"
-              << "  --rigctl HOST:PORT      Rigctl address (default: localhost:4532)\n"
-              << "  --com-port PORT         Serial port for COM PTT (default: COM1)\n"
-              << "  --com-line LINE         COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
+              << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
+              << "                          implies --ptt rigctl)\n"
+              << "      --com-port PORT     Serial port for COM PTT (default: COM1)\n"
+              << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
-              << "  --vox-freq HZ           VOX tone frequency (default: 1200)\n"
-              << "  --vox-lead MS           VOX lead time in ms (default: 150)\n"
-              << "  --vox-tail MS           VOX tail time in ms (default: 100)\n"
+              << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
+              << "      --vox-lead MS       VOX lead time in ms (default: 550)\n"
+              << "      --vox-tail MS       VOX tail time in ms (default: 500)\n"
 #ifdef WITH_CM108
-              << "  --cm108-gpio N          CM108 GPIO pin for PTT (default: 3)\n"
-              << "  --cm108-device SPEC     CM108 device to use: serial or USB path\n"
+              << "      --cm108-gpio N      CM108 GPIO pin for PTT (default: 3)\n"
+              << "      --cm108-device SPEC CM108 device to use: serial or USB path\n"
               << "                          (default: first compatible device)\n"
-              << "  --list-cm108            List CM108-compatible devices and exit\n"
 #endif
-              << "  --ptt-delay MS          PTT delay before TX (default: 50)\n"
-              << "  --ptt-tail MS           PTT tail after TX (default: 50)\n"
-              << "\nRX decoder options:\n"
-              << "  --no-mfsk-rx            Disable the 3 always-on MFSK RX decoders to save CPU\n"
-              << "                          (ignored while an MFSK mode is selected for TX)\n"
-              << "  --no-ofdm-rx            Disable the OFDM RX decoder to save CPU\n"
-              << "                          (ignored while an OFDM mode is selected for TX)\n"
-              << "  --no-robust-rx          Disable the 2 ROBUST (RDM) RX decoders to save CPU\n"
-              << "                          (ignored while a ROBUST mode is selected for TX)\n"
-              << "\nCSMA options:\n"
-              << "  --no-csma               Disable CSMA carrier sense\n"
-              << "  --csma-threshold DB     Carrier sense threshold (default: -30)\n"
-              << "  --csma-slot MS          Slot time in ms (default: 500)\n"
-              << "  --csma-quiet MS         Idle time before contending (default: 0 = auto from frame airtime)\n"
-              << "  --csma-cw N             Contention window in slots (default: 8)\n"
-              << "  --csma-dither MS        Responder delay spread from callsign hash (default: 250, 0 = off)\n"
-              << "  --csma-burst N          Packets sent per channel acquisition, 1-4 (default: 2)\n"
-              << "  --lead-tone             Send tone during TXDelay so others detect keyup (default)\n"
-              << "  --no-lead-tone          Send silence during TXDelay instead\n"
-              << "  --csma-persist N        P-persistence 0-255 (deprecated, unused)\n"
+              << "      --ptt-delay MS      PTT delay before TX (default: 50)\n"
+              << "      --ptt-tail MS       PTT tail after TX (default: 50)\n"
+              << "      --tx-delay MS       TXDelay ahead of the frame, 250-2500 (default: 500)\n"
+              << "\nCSMA:\n"
+              << "      --no-csma           Disable CSMA, transmit as soon as a packet is queued\n"
+              << "      --csma-mode MODE    threshold, sync or ranked (default: threshold)\n"
+              << "                          threshold: busy = any audio over --csma-threshold\n"
+              << "                          sync:      busy = a real modem signal only\n"
+              << "                          ranked:    sync plus stations take timed turns\n"
+              << "      --csma-band BAND    Timing profile: hf or vhf (default: hf)\n"
+              << "      --csma-preset NAME  bench, relaxed, moderate or busy; sets quiet, window,\n"
+              << "                          slot, burst, dither and lead tone for the chosen band\n"
+              << "      --csma-threshold DB Carrier sense threshold, threshold mode (default: -30)\n"
+              << "      --csma-slot MS      Slot time in ms (default: 500)\n"
+              << "      --csma-quiet MS     Idle time before contending (default: 0 = auto)\n"
+              << "      --csma-cw N         Contention window in slots (default: 8)\n"
+              << "      --csma-dither MS    Responder delay spread from callsign hash\n"
+              << "                          (default: 250, 0 = off)\n"
+              << "      --csma-burst N      Packets sent per channel acquisition, 1-4 (default: 2)\n"
+              << "      --lead-tone         Send tone during TXDelay so others detect keyup (default)\n"
+              << "      --no-lead-tone      Send silence during TXDelay instead\n"
+              << "      --fast-floor        Drop the noise floor estimate quickly, sync mode (default)\n"
+              << "      --no-fast-floor     Keep the slower noise floor estimate\n"
+              << "      --beacon-interval S Presence tone interval in ranked mode, 45-90 (default: 45)\n"
               << "\nFragmentation:\n"
-              << "  --frag                  Enable packet fragmentation/reassembly\n"
-              << "  --no-frag               Disable fragmentation (default)\n"
-              << "\nTX Blanking:\n"
-              << "  --tx-blank              Suppress decoder during TX\n"
-              << "  --no-tx-blank           Disable TX blanking (default)\n"
-              << "\n"
-#ifdef WITH_UI
-              << "  -h, --headless          Run without TUI\n"
-#endif
-              << "  -v, --verbose           Verbose output\n"
-              << "      --debug             Log heard station IDs and population tracking\n"
-              << "  --config [FILE]         Load options from FILE\n"
-              << "                          (defaults to %APPDATA%\\modem73\\settings)\n"
-              << "  --help                  Show this help\n"
+              << "      --frag              Enable packet fragmentation/reassembly\n"
+              << "      --no-frag           Disable fragmentation (default)\n"
+              << "\nTX blanking:\n"
+              << "      --tx-blank          Suppress the decoder during TX\n"
+              << "      --no-tx-blank       Disable TX blanking (default)\n"
               << "\nSettings are saved to %APPDATA%\\modem73\\settings\n";
 }
 
@@ -2498,7 +2788,7 @@ int main(int argc, char** argv) {
             print_help(argv[0]);
             return 0;
         } else if (arg == "--list-audio") {
-            std::cout << "Input  0devices:\n";
+            std::cout << "Input devices:\n";
             auto input_devices = MiniAudio::list_capture_devices();
             for (const auto& dev : input_devices) {
                 std::cout << "  " << dev.second << "\n";
@@ -2534,7 +2824,7 @@ int main(int argc, char** argv) {
             g_use_ui = false;
 #endif
         } else if ((arg == "-p" || arg == "--port") && i + 1 < argc) {
-            config.port = std::atoi(argv[++i]);
+            config.port = std::min(65535, std::max(1, std::atoi(argv[++i])));
             cli_set.insert("port");
         } else if (arg == "--bind" && i + 1 < argc) {
             config.bind_address = argv[++i];
@@ -2567,25 +2857,77 @@ int main(int argc, char** argv) {
         } else if (arg == "--output-device" && i + 1 < argc) {
             config.audio_output_device = argv[++i];
             cli_set.insert("audio_output");
+        } else if (arg == "--tx-level" && i + 1 < argc) {
+            config.tx_drive = clamp_arg("--tx-level", argv[++i], 5, 100) / 100.0f;
+            cli_set.insert("tx_drive");
         } else if ((arg == "-c" || arg == "--callsign") && i + 1 < argc) {
             config.callsign = argv[++i];
             for (auto& ch : config.callsign)
                 ch = toupper((unsigned char)ch);
             cli_set.insert("callsign");
+        } else if (arg == "--modem" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, MODEM_TYPE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--modem", value, MODEM_TYPE_OPTS);
+                return 1;
+            }
+            config.modem_type = idx;
+            cli_set.insert("modem_type");
+        } else if (arg == "--mfsk-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, MFSK_MODE_NAMES);
+            if (idx < 0) {
+                print_arg_options("--mfsk-mode", value, MFSK_MODE_NAMES);
+                return 1;
+            }
+            config.mfsk_mode = idx;
+            config.modem_type = 1;
+            cli_set.insert("mfsk_mode");
+            cli_set.insert("modem_type");
+        } else if (arg == "--robust-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, ROBUST_MODE_NAMES);
+            if (idx < 0) {
+                print_arg_options("--robust-mode", value, ROBUST_MODE_NAMES);
+                return 1;
+            }
+            config.robust_mode = idx;
+            config.modem_type = 2;
+            cli_set.insert("robust_mode");
+            cli_set.insert("modem_type");
         } else if ((arg == "-m" || arg == "--modulation") && i + 1 < argc) {
-            config.modulation = argv[++i];
+            std::string value = argv[++i];
+            int idx = arg_index(value, MOD_OPTS);
+            if (idx < 0) {
+                print_arg_options("--modulation", value, MOD_OPTS);
+                return 1;
+            }
+            config.modulation = MOD_OPTS[idx];
             cli_set.insert("modulation");
         } else if ((arg == "-r" || arg == "--rate") && i + 1 < argc) {
-            config.code_rate = argv[++i];
+            std::string value = argv[++i];
+            int idx = arg_index(value, RATE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--rate", value, RATE_OPTS);
+                return 1;
+            }
+            config.code_rate = RATE_OPTS[idx];
             cli_set.insert("code_rate");
-        } else if ((arg == "-f" || arg == "--freq") && i + 1 < argc) {
-            ++i;
-            std::cerr << "Warning: center frequency is fixed at 1500 Hz" << std::endl;
+        } else if (arg == "--postamble") {
+            config.postamble = true;
+            cli_set.insert("postamble");
+        } else if (arg == "--no-postamble") {
+            config.postamble = false;
+            cli_set.insert("postamble");
         } else if (arg == "--short") {
             config.frame_size = 0;
             cli_set.insert("frame_size");
         } else if (arg == "--normal") {
             config.frame_size = 1;
+            cli_set.insert("frame_size");
+        } else if (arg == "--micro") {
+            config.frame_size = 3;
             cli_set.insert("frame_size");
         } else if (arg == "--long") {
             config.frame_size = 2;
@@ -2660,13 +3002,13 @@ int main(int argc, char** argv) {
                 return 1;
             }
         } else if (arg == "--vox-freq" && i + 1 < argc) {
-            config.vox_tone_freq = std::atoi(argv[++i]);
+            config.vox_tone_freq = std::min(3000, std::max(300, std::atoi(argv[++i])));
             cli_set.insert("vox_tone_freq");
         } else if (arg == "--vox-lead" && i + 1 < argc) {
-            config.vox_lead_ms = std::atoi(argv[++i]);
+            config.vox_lead_ms = std::min(2000, std::max(50, std::atoi(argv[++i])));
             cli_set.insert("vox_lead_ms");
         } else if (arg == "--vox-tail" && i + 1 < argc) {
-            config.vox_tail_ms = std::atoi(argv[++i]);
+            config.vox_tail_ms = std::min(2000, std::max(50, std::atoi(argv[++i])));
             cli_set.insert("vox_tail_ms");
 #ifdef WITH_CM108
         } else if (arg == "--cm108-gpio" && i + 1 < argc) {
@@ -2677,12 +3019,14 @@ int main(int argc, char** argv) {
             cli_set.insert("cm108_device");
 #endif
         } else if (arg == "--ptt-delay" && i + 1 < argc) {
-            config.ptt_delay_ms = std::atoi(argv[++i]);
+            config.ptt_delay_ms = clamp_arg("--ptt-delay", argv[++i], 0, 2000);
+            cli_set.insert("ptt_delay_ms");
         } else if (arg == "--ptt-tail" && i + 1 < argc) {
-            config.ptt_tail_ms = std::atoi(argv[++i]);
-        } else if (arg == "--no-rigctl") {
-            config.ptt_type = PTTType::NONE;
-            cli_set.insert("ptt_type");
+            config.ptt_tail_ms = clamp_arg("--ptt-tail", argv[++i], 0, 2000);
+            cli_set.insert("ptt_tail_ms");
+        } else if (arg == "--tx-delay" && i + 1 < argc) {
+            config.tx_delay_ms = clamp_arg("--tx-delay", argv[++i], 250, 2500);
+            cli_set.insert("tx_delay_ms");
         } else if (arg == "--no-mfsk-rx") {
             config.mfsk_rx_enabled = false;
             cli_set.insert("mfsk_rx_enabled");
@@ -2695,23 +3039,69 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-csma") {
             config.csma_enabled = false;
             cli_set.insert("csma_enabled");
+        } else if (arg == "--csma-mode" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, CSMA_MODE_OPTS);
+            if (idx < 0) {
+                print_arg_options("--csma-mode", value, CSMA_MODE_OPTS);
+                return 1;
+            }
+            config.csma_sync_only = idx >= 1;
+            config.csma_ranked = idx == 2;
+            cli_set.insert("csma_sync_only");
+            cli_set.insert("csma_ranked");
+        } else if (arg == "--csma-band" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = arg_index(value, CSMA_BAND_OPTS);
+            if (idx < 0) {
+                print_arg_options("--csma-band", value, CSMA_BAND_OPTS);
+                return 1;
+            }
+            config.csma_band = idx;
+            cli_set.insert("csma_band");
+        } else if (arg == "--csma-preset" && i + 1 < argc) {
+            std::string value = argv[++i];
+            int idx = -1;
+            for (int p = 0; p < CSMA_PRESET_COUNT; ++p)
+                if (arg_ieq(value, CSMA_PRESETS[0][p].name)) { idx = p; break; }
+            if (idx < 0) {
+                std::cerr << "Invalid --csma-preset '" << value << "', expected one of:";
+                for (int p = 0; p < CSMA_PRESET_COUNT; ++p)
+                    std::cerr << ' ' << CSMA_PRESETS[0][p].name;
+                std::cerr << std::endl;
+                return 1;
+            }
+            // presets are per band, so --csma-band must come first to take effect
+            const CsmaPreset& preset = CSMA_PRESETS[config.csma_band & 1][idx];
+            config.csma_quiet_ms = preset.quiet_ms;
+            config.csma_cw = preset.cw;
+            config.slot_time_ms = preset.slot_ms;
+            config.csma_burst = preset.burst;
+            config.csma_responder_dither = preset.dither;
+            config.tx_lead_tone = preset.lead_tone;
+            cli_set.insert("csma_quiet_ms");
+            cli_set.insert("csma_cw");
+            cli_set.insert("slot_time_ms");
+            cli_set.insert("csma_burst");
+            cli_set.insert("csma_responder_dither");
+            cli_set.insert("tx_lead_tone");
         } else if (arg == "--csma-threshold" && i + 1 < argc) {
-            config.carrier_threshold_db = std::atof(argv[++i]);
+            config.carrier_threshold_db = clamp_arg_f("--csma-threshold", argv[++i], -80.0f, 0.0f);
             cli_set.insert("carrier_threshold_db");
         } else if (arg == "--csma-slot" && i + 1 < argc) {
-            config.slot_time_ms = std::atoi(argv[++i]);
+            config.slot_time_ms = clamp_arg("--csma-slot", argv[++i], 50, 5000);
             cli_set.insert("slot_time_ms");
         } else if (arg == "--csma-quiet" && i + 1 < argc) {
-            config.csma_quiet_ms = std::atoi(argv[++i]);
+            config.csma_quiet_ms = clamp_arg("--csma-quiet", argv[++i], 0, 10000);
             cli_set.insert("csma_quiet_ms");
         } else if (arg == "--csma-cw" && i + 1 < argc) {
-            config.csma_cw = std::atoi(argv[++i]);
+            config.csma_cw = clamp_arg("--csma-cw", argv[++i], 2, 32);
             cli_set.insert("csma_cw");
         } else if (arg == "--csma-dither" && i + 1 < argc) {
-            config.csma_responder_dither = std::atoi(argv[++i]);
+            config.csma_responder_dither = clamp_arg("--csma-dither", argv[++i], 0, 3000);
             cli_set.insert("csma_responder_dither");
         } else if (arg == "--csma-burst" && i + 1 < argc) {
-            config.csma_burst = std::atoi(argv[++i]);
+            config.csma_burst = clamp_arg("--csma-burst", argv[++i], 1, 4);
             cli_set.insert("csma_burst");
         } else if (arg == "--lead-tone") {
             config.tx_lead_tone = true;
@@ -2719,9 +3109,15 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-lead-tone") {
             config.tx_lead_tone = false;
             cli_set.insert("tx_lead_tone");
-        } else if (arg == "--csma-persist" && i + 1 < argc) {
-            config.p_persistence = std::atoi(argv[++i]);
-            cli_set.insert("p_persistence");
+        } else if (arg == "--fast-floor") {
+            config.csma_fast_floor = true;
+            cli_set.insert("csma_fast_floor");
+        } else if (arg == "--no-fast-floor") {
+            config.csma_fast_floor = false;
+            cli_set.insert("csma_fast_floor");
+        } else if (arg == "--beacon-interval" && i + 1 < argc) {
+            config.beacon_interval_s = clamp_arg("--beacon-interval", argv[++i], 45, 90);
+            cli_set.insert("beacon_interval_s");
         } else if (arg == "--frag") {
             config.fragmentation_enabled = true;
             cli_set.insert("fragmentation_enabled");
@@ -2734,6 +3130,19 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-tx-blank") {
             config.tx_blanking_enabled = false;
             cli_set.insert("tx_blanking_enabled");
+        // deprecated, kept so existing scripts still start; hidden from --help
+        } else if ((arg == "-f" || arg == "--freq") && i + 1 < argc) {
+            ++i;
+            std::cerr << "Warning: " << arg
+                      << " is deprecated, center frequency is fixed at 1500 Hz" << std::endl;
+        } else if (arg == "--csma-persist" && i + 1 < argc) {
+            ++i;
+            std::cerr << "Warning: --csma-persist is deprecated and ignored,"
+                         " use --csma-cw and --csma-slot" << std::endl;
+        } else if (arg == "--no-rigctl") {
+            config.ptt_type = PTTType::NONE;
+            cli_set.insert("ptt_type");
+            std::cerr << "Warning: --no-rigctl is deprecated, use --ptt none" << std::endl;
         } else {
             std::cerr << "Unknown option: " << arg << std::endl;
             print_help(argv[0]);
@@ -2751,6 +3160,13 @@ int main(int argc, char** argv) {
         } else {
             std::cerr << "Could not read config file: " << config.config_file << std::endl;
         }
+    }
+
+    if (!g_use_ui && config.csma_enabled && !config.tx_blanking_enabled &&
+        !g_tx_blanking_configured && !cli_set.count("tx_blanking_enabled")) {
+        config.tx_blanking_enabled = true;
+        std::cerr << "TX blanking enable "
+                  << std::endl;
     }
 
 #ifdef WITH_UI
@@ -2793,10 +3209,14 @@ int main(int argc, char** argv) {
                 // Apply loaded settings to config
                 if (!cli_set.count("callsign"))
                     config.callsign = ui_state.callsign;
-                config.modem_type = ui_state.modem_type_index;
-                config.mfsk_mode = ui_state.mfsk_mode_index;
-                config.robust_mode = ui_state.robust_mode_index;
-                config.tx_drive = ui_state.tx_drive;
+                if (!cli_set.count("modem_type"))
+                    config.modem_type = ui_state.modem_type_index;
+                if (!cli_set.count("mfsk_mode"))
+                    config.mfsk_mode = ui_state.mfsk_mode_index;
+                if (!cli_set.count("robust_mode"))
+                    config.robust_mode = ui_state.robust_mode_index;
+                if (!cli_set.count("tx_drive"))
+                    config.tx_drive = ui_state.tx_drive;
                 if (!cli_set.count("center_freq"))
                     config.center_freq = ui_state.center_freq;
                 if (!cli_set.count("modulation"))
@@ -2805,12 +3225,18 @@ int main(int argc, char** argv) {
                     config.code_rate = CODE_RATE_OPTIONS[ui_state.code_rate_index];
                 if (!cli_set.count("frame_size"))
                     config.frame_size = ui_state.frame_size;
-                config.postamble = ui_state.postamble;
+                if (!cli_set.count("postamble"))
+                    config.postamble = ui_state.postamble;
                 if (!cli_set.count("csma_enabled"))
                     config.csma_enabled = ui_state.csma_enabled;
-                config.csma_sync_only = ui_state.csma_sync_only;
-                config.csma_fast_floor = ui_state.csma_fast_floor;
-                config.csma_ranked = ui_state.csma_ranked;
+                if (!cli_set.count("csma_sync_only"))
+                    config.csma_sync_only = ui_state.csma_sync_only;
+                if (!cli_set.count("csma_fast_floor"))
+                    config.csma_fast_floor = ui_state.csma_fast_floor;
+                if (!cli_set.count("csma_ranked"))
+                    config.csma_ranked = ui_state.csma_ranked;
+                if (!cli_set.count("csma_band"))
+                    config.csma_band = ui_state.csma_band;
                 if (!cli_set.count("carrier_threshold_db"))
                     config.carrier_threshold_db = ui_state.carrier_threshold_db;
                 if (!cli_set.count("slot_time_ms"))
@@ -2831,6 +3257,17 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
+                if (!ui_state.tx_blanking_auto && config.csma_enabled &&
+                    !cli_set.count("tx_blanking_enabled")) {
+                    if (!config.tx_blanking_enabled) {
+                        config.tx_blanking_enabled = true;
+                        ui_state.tx_blanking_enabled = true;
+                        std::cerr << "TX blanking enabled "
+                                  << std::endl;
+                    }
+                    ui_state.tx_blanking_auto = 1;
+                    ui_state.save_settings();
+                }
                 if (!cli_set.count("ofdm_rx_enabled"))
                     config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
                 if (!cli_set.count("robust_rx_enabled"))
@@ -2872,6 +3309,10 @@ int main(int argc, char** argv) {
                     config.vox_tone_freq = ui_state.vox_tone_freq;
                 if (!cli_set.count("vox_lead_ms"))
                     config.vox_lead_ms = ui_state.vox_lead_ms;
+                if (!cli_set.count("tx_delay_ms"))
+                    config.tx_delay_ms = ui_state.tx_delay_ms;
+                if (!cli_set.count("beacon_interval_s"))
+                    config.beacon_interval_s = ui_state.beacon_interval_s;
                 if (!cli_set.count("vox_tail_ms"))
                     config.vox_tail_ms = ui_state.vox_tail_ms;
 
@@ -2929,6 +3370,7 @@ int main(int argc, char** argv) {
                 ui_state.csma_sync_only = config.csma_sync_only;
                 ui_state.csma_fast_floor = config.csma_fast_floor;
                 ui_state.csma_ranked = config.csma_ranked;
+                ui_state.csma_band = config.csma_band;
                 ui_state.carrier_threshold_db = config.carrier_threshold_db;
                 ui_state.slot_time_ms = config.slot_time_ms;
                 ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -2956,6 +3398,8 @@ int main(int argc, char** argv) {
                 ui_state.vox_tone_freq = config.vox_tone_freq;
                 ui_state.vox_lead_ms = config.vox_lead_ms;
                 ui_state.vox_tail_ms = config.vox_tail_ms;
+                ui_state.tx_delay_ms = config.tx_delay_ms;
+                ui_state.beacon_interval_s = config.beacon_interval_s;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
                 ui_state.com_ptt_line = config.com_ptt_line;
@@ -2992,12 +3436,16 @@ int main(int argc, char** argv) {
         
         ui_state.callsign = config.callsign;
         ui_state.center_freq = config.center_freq;
+        ui_state.modem_type_index = config.modem_type;
+        ui_state.mfsk_mode_index = config.mfsk_mode;
+        ui_state.robust_mode_index = config.robust_mode;
         ui_state.frame_size = config.frame_size;
         ui_state.postamble = config.postamble;
         ui_state.csma_enabled = config.csma_enabled;
         ui_state.csma_sync_only = config.csma_sync_only;
         ui_state.csma_fast_floor = config.csma_fast_floor;
         ui_state.csma_ranked = config.csma_ranked;
+        ui_state.csma_band = config.csma_band;
         ui_state.carrier_threshold_db = config.carrier_threshold_db;
         ui_state.slot_time_ms = config.slot_time_ms;
         ui_state.csma_quiet_ms = config.csma_quiet_ms;
@@ -3006,6 +3454,7 @@ int main(int argc, char** argv) {
         ui_state.csma_burst = config.csma_burst;
         ui_state.tx_lead_tone = config.tx_lead_tone;
         ui_state.p_persistence = config.p_persistence;
+        ui_state.tx_drive = config.tx_drive;
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
         ui_state.com_port = config.com_port;
@@ -3052,6 +3501,8 @@ int main(int argc, char** argv) {
         ui_state.vox_tone_freq = config.vox_tone_freq;
         ui_state.vox_lead_ms = config.vox_lead_ms;
         ui_state.vox_tail_ms = config.vox_tail_ms;
+        ui_state.tx_delay_ms = config.tx_delay_ms;
+        ui_state.beacon_interval_s = config.beacon_interval_s;
         
 
 
@@ -3219,6 +3670,8 @@ int main(int argc, char** argv) {
                 cJSON_AddBoolToObject(j, "csma_sync_only", cfg.csma_sync_only);
                 cJSON_AddBoolToObject(j, "csma_fast_floor", cfg.csma_fast_floor);
                 cJSON_AddBoolToObject(j, "csma_ranked", cfg.csma_ranked);
+                cJSON_AddNumberToObject(j, "beacon_interval_s", cfg.beacon_interval_s);
+                cJSON_AddNumberToObject(j, "csma_band", cfg.csma_band);
                 cJSON_AddNumberToObject(j, "carrier_threshold_db", cfg.carrier_threshold_db);
                 cJSON_AddNumberToObject(j, "p_persistence", cfg.p_persistence);
                 cJSON_AddNumberToObject(j, "slot_time_ms", cfg.slot_time_ms);
@@ -3227,6 +3680,7 @@ int main(int argc, char** argv) {
                 cJSON_AddNumberToObject(j, "csma_responder_dither", cfg.csma_responder_dither);
                 cJSON_AddNumberToObject(j, "csma_burst", cfg.csma_burst);
                 cJSON_AddBoolToObject(j, "tx_lead_tone", cfg.tx_lead_tone);
+                cJSON_AddNumberToObject(j, "tx_drive", cfg.tx_drive);
                 cJSON_AddBoolToObject(j, "tx_blanking_enabled", cfg.tx_blanking_enabled);
                 cJSON_AddBoolToObject(j, "fragmentation_enabled", cfg.fragmentation_enabled);
                 cJSON_AddBoolToObject(j, "mfsk_rx_enabled", cfg.mfsk_rx_enabled);
@@ -3278,6 +3732,11 @@ int main(int argc, char** argv) {
                     new_config.csma_fast_floor = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_ranked")) && cJSON_IsBool(item))
                     new_config.csma_ranked = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "beacon_interval_s")) && cJSON_IsNumber(item)
+                    && item->valueint >= 45 && item->valueint <= 90)
+                    new_config.beacon_interval_s = item->valueint;
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "csma_band")) && cJSON_IsNumber(item))
+                    new_config.csma_band = item->valueint != 0 ? 1 : 0;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "carrier_threshold_db")) && cJSON_IsNumber(item))
                     new_config.carrier_threshold_db = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "p_persistence")) && cJSON_IsNumber(item))
@@ -3294,6 +3753,9 @@ int main(int argc, char** argv) {
                     new_config.csma_burst = item->valueint;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_lead_tone")) && cJSON_IsBool(item))
                     new_config.tx_lead_tone = cJSON_IsTrue(item);
+                if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_drive")) && cJSON_IsNumber(item)
+                    && item->valuedouble >= 0.05 && item->valuedouble <= 1.0)
+                    new_config.tx_drive = (float)item->valuedouble;
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "tx_blanking_enabled")) && cJSON_IsBool(item))
                     new_config.tx_blanking_enabled = cJSON_IsTrue(item);
                 if ((item = cJSON_GetObjectItemCaseSensitive(params, "fragmentation_enabled")) && cJSON_IsBool(item))
@@ -3321,8 +3783,10 @@ int main(int argc, char** argv) {
                     g_ui_state->postamble = new_config.postamble;
                     g_ui_state->csma_enabled = new_config.csma_enabled;
                     g_ui_state->csma_sync_only = new_config.csma_sync_only;
+                    g_ui_state->beacon_interval_s = new_config.beacon_interval_s;
                     g_ui_state->carrier_threshold_db = new_config.carrier_threshold_db;
                     g_ui_state->p_persistence = new_config.p_persistence;
+                    g_ui_state->tx_drive = applied.tx_drive;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
                     g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
@@ -3349,6 +3813,10 @@ int main(int argc, char** argv) {
                 }
 #endif
                 return rejected.empty();
+            };
+
+            ctrl_iface.send_beacon = [&tnc]() -> bool {
+                return tnc.queue_beacon();
             };
 
             ctrl_iface.rigctl_command = [&tnc](const std::string& cmd) -> std::string {
@@ -3386,6 +3854,7 @@ int main(int argc, char** argv) {
                 new_config.csma_sync_only = state.csma_sync_only;
                 new_config.csma_fast_floor = state.csma_fast_floor;
                 new_config.csma_ranked = state.csma_ranked;
+                new_config.csma_band = state.csma_band;
                 new_config.carrier_threshold_db = state.carrier_threshold_db;
                 new_config.p_persistence = state.p_persistence;
                 new_config.slot_time_ms = state.slot_time_ms;
@@ -3409,6 +3878,8 @@ int main(int argc, char** argv) {
                 new_config.vox_tone_freq = state.vox_tone_freq;
                 new_config.vox_lead_ms = state.vox_lead_ms;
                 new_config.vox_tail_ms = state.vox_tail_ms;
+                new_config.tx_delay_ms = state.tx_delay_ms;
+                new_config.beacon_interval_s = state.beacon_interval_s;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
                 new_config.com_ptt_line = state.com_ptt_line;
@@ -3447,7 +3918,14 @@ int main(int argc, char** argv) {
 
             // Run TNC in background thread
             std::thread tnc_thread([&tnc]() {
-                tnc.run();
+                try {
+                    tnc.run();
+                } catch (const std::exception& e) {
+                    tnc.unkey();
+                    ui_log(std::string("FATAL: ") + e.what());
+                    g_fatal_error = e.what();
+                    g_running = false;
+                }
             });
             
             // Status update thread 
@@ -3482,6 +3960,11 @@ int main(int argc, char** argv) {
         if (ctrl) ctrl->stop();
     } catch (const std::exception& e) {
         std::cerr << "error " << e.what() << std::endl;
+        return 1;
+    }
+
+    if (!g_fatal_error.empty()) {
+        std::cerr << "error " << g_fatal_error << std::endl;
         return 1;
     }
     
