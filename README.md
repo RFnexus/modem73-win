@@ -107,6 +107,37 @@ modem73.exe --headless
 modem73.exe --help
 ```
 
+### Selecting a mode
+
+```
+# OFDM (default), pick modulation, code rate and frame size
+modem73.exe -m QAM16 -r 3/4 --normal
+
+# ROBUST, suffix S for short frames
+modem73.exe --robust-mode RDM-600S
+
+# MFSK
+modem73.exe --mfsk-mode MFSK-16
+```
+
+### CSMA
+
+```
+# Pick the busy detector, then a band and preset for the timings
+modem73.exe --csma-mode sync --csma-band vhf --csma-preset moderate
+
+# Individual knobs override the preset when they come after it
+modem73.exe --csma-band hf --csma-preset relaxed --csma-burst 3
+```
+
+### TX audio level
+
+```
+# Soundcard output drive, 5-100 percent
+modem73.exe --tx-level 60
+```
+
+
 ### PTT options 
 
 ```
