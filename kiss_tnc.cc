@@ -1057,6 +1057,20 @@ private:
 #endif
 
         // Add length prefix framing
+        bool data_oversize = false;
+        {
+            size_t cap = payload_size_;
+            if (config_.modem_type == 0 && oper_mode_override >= 0)
+                cap = encoder_->get_payload_size(oper_mode_override);
+            else if (config_.modem_type == 2 && oper_mode_override >= 0 &&
+                     oper_mode_override < ROBUST_MODE_COUNT)
+                cap = robust_encoder_->get_payload_size((RobustMode)oper_mode_override);
+            if (cap < 2 || data.size() > cap - 2) {
+                ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
+                       std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
+                data_oversize = true;
+            }
+        }
         auto framed_data = frame_with_length(data);
 
         // Encode to audio
@@ -1089,8 +1103,9 @@ private:
             );
         }
         
+        if (data_oversize) samples.clear();
         if (samples.empty() && !beacon) {
-            ui_log("TX: Encoding failed");
+            if (!data_oversize) ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
@@ -2115,7 +2130,7 @@ public:
     float alc_auto_tune() {
         if (alc_tune_active_.exchange(true))
             return -1.0f;
-        bool busy = tx_blanking_active_.load();
+        bool busy = tx_blanking_active_.load() || tx_on_air_.load();
 #ifdef WITH_UI
         if (g_ui_state && g_ui_state->transmitting.load())
             busy = true;
