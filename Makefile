@@ -6,9 +6,16 @@ WINDRES = x86_64-w64-mingw32-windres
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra
 
 GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
-BASE_VERSION := 2.3.1
+BASE_VERSION := 2.3.5
 VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(BASE_VERSION))
 CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
+
+# Numeric version parts for the Windows VERSIONINFO resource
+# (strips any -suffix, e.g. "0.1.0-dev" -> 0 1 0)
+VER_NUM := $(subst ., ,$(firstword $(subst -, ,$(VERSION))))
+VER_MAJOR := $(or $(word 1,$(VER_NUM)),0)
+VER_MINOR := $(or $(word 2,$(VER_NUM)),0)
+VER_PATCH := $(or $(word 3,$(VER_NUM)),0)
 LDFLAGS = -static -lws2_32 -lsetupapi
 
 # dependencies
@@ -53,7 +60,7 @@ $(PDCURSES)/%.o: $(PDCURSES)/%.c
 	$(CC) -c -O2 $(PDC_FLAGS) -I$(PDCURSES) -o $@ $<
 
 modem73_res.o: modem73.rc modem73.ico
-	$(WINDRES) modem73.rc $@
+	$(WINDRES) -DVER_MAJOR=$(VER_MAJOR) -DVER_MINOR=$(VER_MINOR) -DVER_PATCH=$(VER_PATCH) modem73.rc $@
 
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
 	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(PDC_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)

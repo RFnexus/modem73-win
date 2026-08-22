@@ -1,10 +1,23 @@
 #include <winver.h>
 
+/* Version numbers are injected by the Makefile via windres -D flags */
+#ifndef VER_MAJOR
+#define VER_MAJOR 0
+#define VER_MINOR 0
+#define VER_PATCH 0
+#endif
+
+/* Build "x.y.z" here; string -D defines are escaped differently by GNU
+   windres and llvm-windres, so only numbers cross the command line. */
+#define STR_HELPER(x) #x
+#define STR(x) STR_HELPER(x)
+#define VER_STR STR(VER_MAJOR) "." STR(VER_MINOR) "." STR(VER_PATCH)
+
 1 ICON "modem73.ico"
 
 1 VERSIONINFO
-FILEVERSION     2,3,0,0
-PRODUCTVERSION  2,3,0,0
+FILEVERSION     VER_MAJOR,VER_MINOR,VER_PATCH,0
+PRODUCTVERSION  VER_MAJOR,VER_MINOR,VER_PATCH,0
 FILEOS          VOS_NT_WINDOWS32
 FILETYPE        VFT_APP
 BEGIN
@@ -12,12 +25,14 @@ BEGIN
   BEGIN
     BLOCK "040904B0"
     BEGIN
+      VALUE "CompanyName", "MODEM73 project"
       VALUE "FileDescription", "MODEM73 KISS TNC"
       VALUE "ProductName", "MODEM73"
       VALUE "InternalName", "modem73"
       VALUE "OriginalFilename", "modem73.exe"
-      VALUE "FileVersion", "2.3.0"
-      VALUE "ProductVersion", "2.3.0"
+      VALUE "LegalCopyright", "Public domain (Unlicense)"
+      VALUE "FileVersion", VER_STR
+      VALUE "ProductVersion", VER_STR
     END
   END
   BLOCK "VarFileInfo"
