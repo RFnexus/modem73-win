@@ -76,7 +76,9 @@ inline void ui_log(const std::string& msg) {
         g_ui_state->add_log(msg);
     }
 #endif
-    if (g_verbose || !g_use_ui) {
+    if (!g_use_ui) {
+        std::cout << msg << std::endl;
+    } else if (g_verbose) {
         std::cerr << msg << std::endl;
     }
 }
@@ -208,6 +210,8 @@ public:
         robust_encoder_ = std::make_unique<RobustEncoder>();
         robust_decoder_ = std::make_unique<RobustDecoder>(config.center_freq);
         robust_decoder_n_ = std::make_unique<RobustDecoder>(config.center_freq, true);
+        robust_decoder_->debug_log = g_debug;
+        robust_decoder_n_->debug_log = g_debug;
         tone_dcd_ = std::make_unique<ToneDCD>(config.center_freq, config.sample_rate);
 
         std::cerr << "  All encoders/decoders created" << std::endl;
@@ -1311,7 +1315,8 @@ private:
         auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled,
                                          const std::string& mode = "", std::string callsign = "") {
             last_rx_done_ms_.store(steady_now_ms());
-            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
+            ui_log("RX: " + std::to_string(payload.size()) + " bytes" +
+                   (mode.empty() ? "" : " " + mode) + ", SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
                 std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
@@ -1715,8 +1720,25 @@ private:
                     !blanking && !g_ui_state->ptt_on.load(std::memory_order_relaxed) &&
                     !g_ui_state->transmitting.load(std::memory_order_relaxed))
                     g_ui_state->push_scope_audio(buffer.data(), n);
-                if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
+                if (++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
+                    {
+                        auto note = [this](int cur, int& last, const char* what) {
+                            if (cur > last && last >= 0)
+                                ui_log(std::string("RDM: ") + what + " recovered a frame");
+                            last = cur;
+                        };
+                        note(robust_decoder_->stats_backward_rescues, last_bw_, "backward rescue");
+                        note(robust_decoder_n_->stats_backward_rescues, last_bw_n_, "backward rescue");
+                        note(robust_decoder_->stats_ladder_rescues, last_ld_, "retry ladder");
+                        note(robust_decoder_n_->stats_ladder_rescues, last_ld_n_, "retry ladder");
+                        note(robust_decoder_->stats_rescues - robust_decoder_->stats_backward_rescues, last_rescues_, "tail rescue");
+                        note(robust_decoder_n_->stats_rescues - robust_decoder_n_->stats_backward_rescues, last_rescues_n_, "tail rescue");
+                        note(robust_decoder_->stats_retry_success - robust_decoder_->stats_ladder_rescues, last_retries_, "retry decode");
+                        note(robust_decoder_n_->stats_retry_success - robust_decoder_n_->stats_ladder_rescues, last_retries_n_, "retry decode");
+                    }
+                }
+                if (g_ui_state && level_update_counter == 0) {
 
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
@@ -1832,6 +1854,7 @@ private:
                     msg += " [" + serial_ptt_->last_error() + "]";
                 ui_log(msg);
             }
+            ptt_failed_.store(!ok);
         } else if (ok) {
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
@@ -1849,6 +1872,7 @@ private:
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->ptt_on = ptt_state_.load();
+            g_ui_state->ptt_failed = ptt_failed_.load();
         }
 #endif
         return ok;
@@ -1960,6 +1984,14 @@ private:
     std::atomic<bool> rx_running_{false};
     
     Fragmenter fragmenter_;
+    int last_rescues_ = 0;
+    int last_rescues_n_ = 0;
+    int last_retries_ = 0;
+    int last_retries_n_ = 0;
+    int last_bw_ = 0;
+    int last_bw_n_ = 0;
+    int last_ld_ = 0;
+    int last_ld_n_ = 0;
     Reassembler reassembler_;
     
     mutable std::mutex config_mutex_;
@@ -2068,6 +2100,7 @@ private:
     mutable std::mutex ptt_mutex_;
     std::atomic<bool> ptt_state_{false};
     bool ptt_fail_logged_ = false;
+    std::atomic<bool> ptt_failed_{false};
     int ptt_unkey_retries_ = 0;
     std::atomic<int64_t> ptt_deadline_ms_{0};
     static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
@@ -2188,6 +2221,8 @@ public:
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
             config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            config_.fragmentation_enabled = new_config.fragmentation_enabled;
+            config_.tx_delay_ms = new_config.tx_delay_ms;
             config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
             config_.ofdm_rx_enabled = new_config.ofdm_rx_enabled;
             config_.robust_rx_enabled = new_config.robust_rx_enabled;
@@ -2405,6 +2440,10 @@ public:
     int get_client_count() const {
         std::lock_guard<std::mutex> lock(clients_mutex_);
         return clients_.size();
+    }
+
+    bool ptt_failed() const {
+        return ptt_failed_.load();
     }
 
     std::string rigctl_command(const std::string& cmd) {
@@ -3154,11 +3193,20 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    if (!g_use_ui && cli_config && !config.config_file.empty()) {
-        if (apply_settings_file(config.config_file, config, cli_set)) {
-            std::cerr << "Loaded settings from " << config.config_file << std::endl;
+    if (!g_use_ui) {
+        std::string settings_path;
+        if (cli_config && !config.config_file.empty()) {
+            settings_path = config.config_file;
         } else {
-            std::cerr << "Could not read config file: " << config.config_file << std::endl;
+            const char* appdata = getenv("APPDATA");
+            if (appdata) settings_path = std::string(appdata) + "\\modem73\\settings";
+        }
+        if (!settings_path.empty()) {
+            if (apply_settings_file(settings_path, config, cli_set)) {
+                std::cerr << "Loaded settings from " << settings_path << std::endl;
+            } else if (cli_config) {
+                std::cerr << "Could not read config file: " << settings_path << std::endl;
+            }
         }
     }
 
@@ -3610,9 +3658,17 @@ int main(int argc, char** argv) {
         if (config.control_port > 0) {
             ControlPort::TNCInterface ctrl_iface;
 
-            ctrl_iface.get_status = [&tnc]() -> cJSON* {
+            ctrl_iface.get_status = [&tnc, &ui_state]() -> cJSON* {
                 cJSON* j = cJSON_CreateObject();
                 auto stats = tnc.get_decoder_stats();
+                {
+                    TNCConfig c = tnc.get_config();
+                    cJSON_AddNumberToObject(j, "net_bps_estimate",
+                        net_bps_estimate(c.csma_enabled, c.csma_quiet_ms, c.csma_cw,
+                                         c.slot_time_ms, c.csma_burst, c.tx_lead_tone,
+                                         c.tx_delay_ms, ui_state.airtime_seconds,
+                                         ui_state.mtu_bytes));
+                }
 
                 // Channel state
                 const char* state = "idle";
