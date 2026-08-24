@@ -36,7 +36,7 @@ ifneq ($(wildcard deps/hamlib/lib/libhamlib.a),)
     $(info Hamlib PTT support: enabled (found deps/hamlib))
     HAMLIB_FLAGS = -DWITH_HAMLIB
     HAMLIB_INC = -Ideps/hamlib/include
-    HAMLIB_LIBS = deps/hamlib/lib/libhamlib.a -liphlpapi
+    HAMLIB_LIBS = deps/hamlib/lib/libhamlib.a -liphlpapi -lpthread
     SRCS += hamlib_ptt.cc
 else
     $(info Hamlib PTT support: disabled (run ./build-hamlib-win.sh to enable))

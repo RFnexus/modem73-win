@@ -603,7 +603,7 @@ private:
         if (station_id_ == 0)
             station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
         int csma_stage = 0;
-        int csma_clean = 0;
+        int64_t csma_stage_ms = 0;
         int boot_attempt = 0;
         int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_interval_ms = [&]() {
@@ -698,6 +698,11 @@ private:
                     gcfg.contenders = csma_sync_only
                                         ? n_contenders(csma_band == 0) : -1;
                     int raw_pop = gcfg.contenders;
+                    while (csma_stage > 0 &&
+                           steady_now_ms() - csma_stage_ms >= CSMA_STAGE_DECAY_MS) {
+                        csma_stage--;
+                        csma_stage_ms += CSMA_STAGE_DECAY_MS;
+                    }
                     if (occupancy_pct_.load() > 55 || csma_stage >= 1)
                         gcfg.contenders = -1;
                     if (steady_now_ms() - last_burst_end < 3000 &&
@@ -890,13 +895,11 @@ private:
                         continue;
                     }
                     if (csma_sync_only) {
-                        if (busy_episodes >= 2) {
-                            csma_stage = std::min(csma_stage + 2, 2);
-                            csma_clean = 0;
-                        } else if (busy_episodes <= 1 && ++csma_clean >= 3) {
-                            csma_clean = 0;
-                            csma_stage = std::max(csma_stage - 1, 0);
-                        }
+                        if (busy_episodes >= 2)
+                            csma_stage = 2;
+                        else if (csma_stage > 0)
+                            csma_stage--;
+                        csma_stage_ms = steady_now_ms();
                     }
                     if (!g_running)
                         break;
@@ -2062,6 +2065,8 @@ private:
     static constexpr int64_t HEARD_EXPIRY_MS = 300000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
+    // stage a decay after 60 seconds for our contention window
+    static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
     static constexpr int YIELD_BUCKETS = 4;
     static constexpr int64_t PARTICIPATION_MS = 1200000;
     int yield_attempt_ = 0;
