@@ -33,6 +33,7 @@
 #include "tone_dcd.hh"
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
+#include "hamlib_ptt.hh"
 #include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
@@ -282,7 +283,7 @@ public:
         
         // Initialize PTT based on ptt_type
         init_ptt_driver();
-        
+
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ == INVALID_SOCKET) {
             throw std::runtime_error("Failed to create socket");
@@ -364,15 +365,21 @@ public:
             case PTTType::VOX:
                 std::cerr << "PTT: VOX " << config_.vox_tone_freq << "Hz" << std::endl;
                 break;
+            case PTTType::HAMLIB:
+                std::cerr << "PTT: hamlib model " << config_.hamlib_model
+                          << " on " << config_.hamlib_device << std::endl;
+                break;
             case PTTType::COM:
                 std::cerr << "PTT: COM " << config_.com_port 
                           << " (" << PTT_LINE_OPTIONS[config_.com_ptt_line] << ")" << std::endl;
                 break;
-#ifdef WITH_CM108
             case PTTType::CM108:
+#ifdef WITH_CM108
                 std::cerr << "PTT: CM108 (GPIO" << config_.cm108_gpio << ")" << std::endl;
-                break;
+#else
+                std::cerr << "PTT: CM108 not available in this build" << std::endl;
 #endif
+                break;
         }
         
         // Start threads
@@ -1109,7 +1116,7 @@ private:
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1222,7 +1229,7 @@ private:
             if (first) {
                 flush_ptt_reinit();
                 // PTT on (for RIGCTL or COM mode)
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1270,7 +1277,7 @@ private:
                 audio_->drain_playback();
 
                 // PTT off
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1800,6 +1807,9 @@ private:
 
     void init_ptt_driver() {
         rigctl_.reset();
+#ifdef WITH_HAMLIB
+        hamlib_ptt_.reset();
+#endif
         serial_ptt_.reset();
 #ifdef WITH_CM108
         cm108_ptt_.reset();
@@ -1817,6 +1827,20 @@ private:
                 ui_log("PTT: rigctl " + config_.rigctl_host + ":" +
                        std::to_string(config_.rigctl_port));
             }
+        } else if (config_.ptt_type == PTTType::HAMLIB) {
+#ifdef WITH_HAMLIB
+            hamlib_ptt_ = std::make_unique<HamlibPTT>();
+            std::string err;
+            if (!hamlib_ptt_->open(config_.hamlib_model, config_.hamlib_device, config_.hamlib_baud, err)) {
+                ui_log("(!) Hamlib: " + err);
+                ui_log("(!) PTT will not key the radio - check rig model and device");
+            } else {
+                ui_log("Hamlib: rig model " + std::to_string(config_.hamlib_model) + " opened on " + config_.hamlib_device);
+            }
+#else
+            dummy_ptt_ = std::make_unique<DummyPTT>();
+            dummy_ptt_->connect();
+#endif
         } else if (config_.ptt_type == PTTType::COM) {
             serial_ptt_ = std::make_unique<SerialPTT>();
             if (!serial_ptt_->open(config_.com_port,
@@ -1851,6 +1875,10 @@ private:
         bool ok = true;
         if (rigctl_) {
             ok = rigctl_->set_ptt(on);
+#ifdef WITH_HAMLIB
+        } else if (hamlib_ptt_) {
+            ok = hamlib_ptt_->set_ptt(on);
+#endif
         } else if (serial_ptt_) {
             ok = on ? serial_ptt_->ptt_on() : serial_ptt_->ptt_off();
 #ifdef WITH_CM108
@@ -1982,6 +2010,9 @@ private:
 
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
+#ifdef WITH_HAMLIB
+    std::unique_ptr<HamlibPTT> hamlib_ptt_;
+#endif
     std::unique_ptr<SerialPTT> serial_ptt_;
 #ifdef WITH_CM108
     std::unique_ptr<CM108PTT> cm108_ptt_;
@@ -2346,6 +2377,9 @@ public:
             std::lock_guard<std::mutex> plock(ptt_mutex_);
             if (ptt_state_.load()) {
                 if (rigctl_) rigctl_->set_ptt(false);
+#ifdef WITH_HAMLIB
+                else if (hamlib_ptt_) hamlib_ptt_->set_ptt(false);
+#endif
                 else if (serial_ptt_) serial_ptt_->ptt_off();
 #ifdef WITH_CM108
                 else if (cm108_ptt_) cm108_ptt_->set_ptt(false);
@@ -2464,12 +2498,27 @@ public:
     std::string rigctl_command(const std::string& cmd) {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->send_command(cmd);
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->command(cmd);
+#endif
         return "ERR: rigctl not enabled";
     }
 
     bool is_rigctl_connected() const {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->is_connected();
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->is_connected();
+#endif
+        return false;
+    }
+
+    bool hamlib_get_freq(double& hz) {
+#ifdef WITH_HAMLIB
+        std::lock_guard<std::mutex> lock(ptt_mutex_);
+        if (hamlib_ptt_) return hamlib_ptt_->get_freq(hz);
+#endif
+        (void)hz;
         return false;
     }
     
@@ -2573,6 +2622,9 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (v >= 0 && v < ROBUST_MODE_COUNT) config.robust_mode = v;
         }
         else if (!strcmp(key, "perf_log") && take(key)) config.perf_log = atoi(value) != 0;
+        else if (!strcmp(key, "hamlib_model") && take(key)) config.hamlib_model = atoi(value);
+        else if (!strcmp(key, "hamlib_device") && take(key)) config.hamlib_device = value;
+        else if (!strcmp(key, "hamlib_baud") && take(key)) config.hamlib_baud = atoi(value);
         else if (!strcmp(key, "modulation") && take(key)) {
             int idx = atoi(value);
             if (idx >= 0 && idx < N_MOD) config.modulation = MOD_OPTS[idx];
@@ -2624,7 +2676,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (take("audio_input")) config.audio_input_device = value;
             if (take("audio_output")) config.audio_output_device = value;
         }
-        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(atoi(value));
+        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(ptt_type_available(atoi(value)));
         else if (!strcmp(key, "vox_tone_freq") && take(key)) {
             int v = atoi(value);
             if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
@@ -2771,10 +2823,18 @@ void print_help(const char* prog) {
 #ifdef WITH_CM108
               << ", cm108"
 #endif
+#ifdef WITH_HAMLIB
+              << ", hamlib"
+#endif
               << " (default: rigctl)\n"
               << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
               << "                          implies --ptt rigctl)\n"
               << "      --com-port PORT     Serial port for COM PTT (default: COM1)\n"
+#ifdef WITH_HAMLIB
+              << "      --hamlib-model N    Hamlib rig model number for HAMLIB PTT\n"
+              << "      --hamlib-device DEV Serial port or host:port for HAMLIB PTT\n"
+              << "      --hamlib-baud BAUD  Serial speed for HAMLIB PTT (0 = rig default)\n"
+#endif
               << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
               << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
@@ -3000,6 +3060,15 @@ int main(int argc, char** argv) {
             } else {
                 config.rigctl_host = hostport;
             }
+        } else if (arg == "--hamlib-model" && i + 1 < argc) {
+            config.hamlib_model = atoi(argv[++i]);
+            cli_set.insert("hamlib_model");
+        } else if (arg == "--hamlib-device" && i + 1 < argc) {
+            config.hamlib_device = argv[++i];
+            cli_set.insert("hamlib_device");
+        } else if (arg == "--hamlib-baud" && i + 1 < argc) {
+            config.hamlib_baud = atoi(argv[++i]);
+            cli_set.insert("hamlib_baud");
         } else if (arg == "--com-port" && i + 1 < argc) {
             config.com_port = argv[++i];
             cli_set.insert("com_port");
@@ -3047,10 +3116,16 @@ int main(int argc, char** argv) {
 #ifdef WITH_CM108
             else if (ptt_type == "cm108") config.ptt_type = PTTType::CM108;
 #endif
+#ifdef WITH_HAMLIB
+            else if (ptt_type == "hamlib") config.ptt_type = PTTType::HAMLIB;
+#endif
             else {
                 std::cerr << "Unknown PTT type: " << ptt_type << " (use none, rigctl, vox, com"
 #ifdef WITH_CM108
                           << ", cm108"
+#endif
+#ifdef WITH_HAMLIB
+                          << ", hamlib"
 #endif
                           << ")\n";
                 return 1;
@@ -3382,6 +3457,12 @@ int main(int argc, char** argv) {
                 // COM PTT settings
                 if (!cli_set.count("com_port"))
                     config.com_port = ui_state.com_port;
+                if (!cli_set.count("hamlib_model"))
+                    config.hamlib_model = ui_state.hamlib_model;
+                if (!cli_set.count("hamlib_device"))
+                    config.hamlib_device = ui_state.hamlib_device;
+                if (!cli_set.count("hamlib_baud"))
+                    config.hamlib_baud = ui_state.hamlib_baud;
                 if (!cli_set.count("com_ptt_line"))
                     config.com_ptt_line = ui_state.com_ptt_line;
                 if (!cli_set.count("com_invert_dtr"))
@@ -3465,6 +3546,9 @@ int main(int argc, char** argv) {
                 ui_state.beacon_interval_s = config.beacon_interval_s;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
+                ui_state.hamlib_model = config.hamlib_model;
+                ui_state.hamlib_device = config.hamlib_device;
+                ui_state.hamlib_baud = config.hamlib_baud;
                 ui_state.com_ptt_line = config.com_ptt_line;
                 ui_state.com_invert_dtr = config.com_invert_dtr;
                 ui_state.com_invert_rts = config.com_invert_rts;
@@ -3521,6 +3605,9 @@ int main(int argc, char** argv) {
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
         ui_state.com_port = config.com_port;
+        ui_state.hamlib_model = config.hamlib_model;
+        ui_state.hamlib_device = config.hamlib_device;
+        ui_state.hamlib_baud = config.hamlib_baud;
         ui_state.com_ptt_line = config.com_ptt_line;
         ui_state.com_invert_dtr = config.com_invert_dtr;
         ui_state.com_invert_rts = config.com_invert_rts;
@@ -3953,6 +4040,9 @@ int main(int argc, char** argv) {
                 new_config.beacon_interval_s = state.beacon_interval_s;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
+                new_config.hamlib_model = state.hamlib_model;
+                new_config.hamlib_device = state.hamlib_device;
+                new_config.hamlib_baud = state.hamlib_baud;
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;
