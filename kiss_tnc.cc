@@ -53,7 +53,6 @@ std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
-static bool g_tx_blanking_configured = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -1126,6 +1125,7 @@ private:
                 }
             }
             if (last) {
+                tx_on_air_ = false;
                 tx_blanking_active_ = false;
 #ifdef WITH_UI
                 if (g_ui_state) g_ui_state->transmitting = false;
@@ -1946,6 +1946,7 @@ private:
                           << std::endl;
                 ui_log("PTT watchdog: forcing unkey");
                 set_ptt(false);
+                tx_on_air_ = false;
             }
             int64_t reinit_at = ptt_reinit_at_ms_.load();
             if (reinit_at != 0 && steady_now_ms() >= reinit_at)
@@ -2236,6 +2237,7 @@ public:
         }
         audio_->drain_playback();
         set_ptt(false);
+        tx_on_air_ = false;
         tx_blanking_active_ = false;
         if (result > 0) {
             std::lock_guard<std::mutex> lock(config_mutex_);
@@ -2266,7 +2268,7 @@ public:
             config_.csma_responder_dither = new_config.csma_responder_dither;
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
-            config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            config_.tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
             config_.fragmentation_enabled = new_config.fragmentation_enabled;
             config_.tx_delay_ms = new_config.tx_delay_ms;
             config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
@@ -2459,7 +2461,9 @@ public:
         };
     }
 
-    bool is_transmitting() const { return tx_blanking_active_.load(); }
+    bool is_transmitting() const {
+        return tx_on_air_.load() || tx_blanking_active_.load();
+    }
 
     void unkey() {
         set_ptt(false);
@@ -2662,10 +2666,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
-        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) {
-            config.tx_blanking_enabled = atoi(value) != 0;
-            g_tx_blanking_configured = true;
-        }
+        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
         else if (!strcmp(key, "tx_drive") && take(key)) {
             float v = (float)atof(value);
             if (std::isfinite(v) && v >= 0.05f && v <= 1.0f) config.tx_drive = v;
@@ -2873,8 +2874,8 @@ void print_help(const char* prog) {
               << "      --frag              Enable packet fragmentation/reassembly\n"
               << "      --no-frag           Disable fragmentation (default)\n"
               << "\nTX blanking:\n"
-              << "      --tx-blank          Suppress the decoder during TX\n"
-              << "      --no-tx-blank       Disable TX blanking (default)\n"
+              << "      --tx-blank          Suppress the decoder during TX (default always on with CSMA)\n"
+              << "      --no-tx-blank       Disable TX blanking (only takes effect with --no-csma)\n"
               << "\nSettings are saved to %APPDATA%\\modem73\\settings\n";
 }
 
@@ -3300,12 +3301,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!g_use_ui && config.csma_enabled && !config.tx_blanking_enabled &&
-        !g_tx_blanking_configured && !cli_set.count("tx_blanking_enabled")) {
+    if (config.csma_enabled)
         config.tx_blanking_enabled = true;
-        std::cerr << "TX blanking enable "
-                  << std::endl;
-    }
 
 #ifdef WITH_UI
     TNCUIState ui_state;
@@ -3395,17 +3392,6 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
-                if (!ui_state.tx_blanking_auto && config.csma_enabled &&
-                    !cli_set.count("tx_blanking_enabled")) {
-                    if (!config.tx_blanking_enabled) {
-                        config.tx_blanking_enabled = true;
-                        ui_state.tx_blanking_enabled = true;
-                        std::cerr << "TX blanking enabled "
-                                  << std::endl;
-                    }
-                    ui_state.tx_blanking_auto = 1;
-                    ui_state.save_settings();
-                }
                 if (!cli_set.count("ofdm_rx_enabled"))
                     config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
                 if (!cli_set.count("robust_rx_enabled"))
@@ -3946,7 +3932,7 @@ int main(int argc, char** argv) {
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->tx_drive = applied.tx_drive;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
-                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
+                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
                     g_ui_state->ofdm_rx_enabled = new_config.ofdm_rx_enabled;
                     g_ui_state->robust_rx_enabled = new_config.robust_rx_enabled;

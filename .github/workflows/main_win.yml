@@ -48,8 +48,26 @@ jobs:
           tar xf llvm-mingw.tar.xz
           echo "$PWD/${LLVM_MINGW}/bin" >> "$GITHUB_PATH"
 
+      - name: Cache Hamlib
+        id: hamlib-cache
+        uses: actions/cache@v4
+        with:
+          path: deps/hamlib
+          key: hamlib-4.6.5-${{ env.LLVM_MINGW }}
+
+      - name: Build Hamlib
+        if: steps.hamlib-cache.outputs.cache-hit != 'true'
+        run: ./build-hamlib-win.sh
+
       - name: Build
         run: make -j"$(nproc)" VERSION="${{ steps.ver.outputs.version }}"
+
+      - name: Verify Hamlib support is compiled in
+        run: |
+          strings modem73.exe | grep -q "Hamlib" || {
+            echo "::error::modem73.exe has no Hamlib support - build silently lost it"
+            exit 1
+          }
 
       - name: Smoke test
         timeout-minutes: 8
@@ -60,7 +78,8 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wine
           file modem73.exe
           command -v wine
-          timeout -k 5 60 wine modem73.exe --help
+          timeout -k 5 60 wine modem73.exe --help 2>&1 | tee help.txt
+          grep -q "hamlib" help.txt || { echo "::error::hamlib missing from --ptt help"; exit 1; }
           # Don't let lingering wine background processes hold the step's log pipe open
           command -v wineserver >/dev/null && { wineserver -k || true; wineserver -w || true; } || true
 

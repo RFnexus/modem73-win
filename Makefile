@@ -29,6 +29,21 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC) -I$(PDCURSES)
 TARGET = modem73.exe
 
 SRCS = kiss_tnc.cc
+
+# Optional direct Hamlib PTT: run ./build-hamlib-win.sh to produce deps/hamlib,
+# the build picks it up automatically
+ifneq ($(wildcard deps/hamlib/lib/libhamlib.a),)
+    $(info Hamlib PTT support: enabled (found deps/hamlib))
+    HAMLIB_FLAGS = -DWITH_HAMLIB
+    HAMLIB_INC = -Ideps/hamlib/include
+    HAMLIB_LIBS = deps/hamlib/lib/libhamlib.a -liphlpapi
+    SRCS += hamlib_ptt.cc
+else
+    $(info Hamlib PTT support: disabled (run ./build-hamlib-win.sh to enable))
+    HAMLIB_FLAGS =
+    HAMLIB_INC =
+    HAMLIB_LIBS =
+endif
 HDRS = kiss_tnc.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh serial_ptt.hh cm108_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
 
 PDC_FLAGS = -DPDC_WIDE -DPDC_FORCE_UTF8
@@ -63,7 +78,7 @@ modem73_res.o: modem73.rc modem73.ico
 	$(WINDRES) -DVER_MAJOR=$(VER_MAJOR) -DVER_MINOR=$(VER_MINOR) -DVER_PATCH=$(VER_PATCH) modem73.rc $@
 
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
-	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(PDC_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(PDC_FLAGS) $(INCLUDES) $(HAMLIB_INC) -o $@ $(SRCS) $(OBJS) $(HAMLIB_LIBS) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
