@@ -38,17 +38,23 @@ enum class PTTType {
     RIGCTL = 1,
     VOX = 2,
     COM = 3,
-#ifdef WITH_CM108
-    CM108 = 4
-#endif
+    CM108 = 4,
+    HAMLIB = 5
 };
 
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
-    "NONE", "RIGCTL", "VOX", "COM"
-#ifdef WITH_CM108
-    , "CM108"
-#endif
+    "NONE", "RIGCTL", "VOX", "COM", "CM108", "HAMLIB"
 };
+
+inline int ptt_type_available(int v) {
+#ifndef WITH_HAMLIB
+    if (v == static_cast<int>(PTTType::HAMLIB)) return static_cast<int>(PTTType::NONE);
+#endif
+#ifndef WITH_CM108
+    if (v == static_cast<int>(PTTType::CM108)) return static_cast<int>(PTTType::NONE);
+#endif
+    return v;
+}
 
 const std::vector<std::string> PTT_LINE_OPTIONS = {
     "DTR", "RTS", "BOTH"
@@ -84,6 +90,9 @@ struct TNCConfig {
     PTTType ptt_type = PTTType::RIGCTL;  
     
     // Rigctl settings 
+    int hamlib_model = 0;
+    std::string hamlib_device;
+    int hamlib_baud = 0;
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
     
@@ -139,7 +148,7 @@ struct TNCConfig {
     bool fragmentation_enabled = false;
     
     // TX blanking
-    bool tx_blanking_enabled = false;
+    bool tx_blanking_enabled = true;
     
     // Control port
     int control_port = 8073;
@@ -456,6 +465,20 @@ namespace Frag {
     constexpr int REASSEMBLY_IDLE_MS = 120000;
     constexpr int REASSEMBLY_MAX_MS = 600000;
     constexpr size_t MAX_PENDING_PACKETS = 64;
+}
+
+inline int net_bps_estimate(bool csma_enabled, int quiet_ms, int cw, int slot_ms,
+                            int burst, bool lead_tone, int tx_delay_ms,
+                            float airtime_s, int payload_bytes) {
+    if (airtime_s <= 0.0f || payload_bytes <= 0) return 0;
+    float per_frame = airtime_s + tx_delay_ms / 1000.0f + 0.1f;
+    if (!csma_enabled)
+        return (int)(payload_bytes * 8 / per_frame);
+    int b = std::max(1, std::min(4, burst));
+    float access = (quiet_ms + cw * slot_ms * 0.5f) / 1000.0f;
+    float lead = lead_tone ? 0.45f : 0.0f;
+    float cycle = access + lead + b * per_frame;
+    return (int)(b * payload_bytes * 8 / cycle);
 }
 
 class Fragmenter {

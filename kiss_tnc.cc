@@ -33,6 +33,7 @@
 #include "tone_dcd.hh"
 #include "miniaudio_audio.hh"
 #include "rigctl_ptt.hh"
+#include "hamlib_ptt.hh"
 #include "serial_ptt.hh"
 #ifdef WITH_CM108
 #include "cm108_ptt.hh"
@@ -52,7 +53,6 @@ std::string g_fatal_error;
 TNCConfig g_config;
 bool g_verbose = false;
 bool g_debug = false;
-static bool g_tx_blanking_configured = false;
 #ifdef WITH_UI
 bool g_use_ui = true;  
 #else
@@ -76,7 +76,9 @@ inline void ui_log(const std::string& msg) {
         g_ui_state->add_log(msg);
     }
 #endif
-    if (g_verbose || !g_use_ui) {
+    if (!g_use_ui) {
+        std::cout << msg << std::endl;
+    } else if (g_verbose) {
         std::cerr << msg << std::endl;
     }
 }
@@ -208,6 +210,8 @@ public:
         robust_encoder_ = std::make_unique<RobustEncoder>();
         robust_decoder_ = std::make_unique<RobustDecoder>(config.center_freq);
         robust_decoder_n_ = std::make_unique<RobustDecoder>(config.center_freq, true);
+        robust_decoder_->debug_log = g_debug;
+        robust_decoder_n_->debug_log = g_debug;
         tone_dcd_ = std::make_unique<ToneDCD>(config.center_freq, config.sample_rate);
 
         std::cerr << "  All encoders/decoders created" << std::endl;
@@ -278,7 +282,7 @@ public:
         
         // Initialize PTT based on ptt_type
         init_ptt_driver();
-        
+
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ == INVALID_SOCKET) {
             throw std::runtime_error("Failed to create socket");
@@ -360,15 +364,21 @@ public:
             case PTTType::VOX:
                 std::cerr << "PTT: VOX " << config_.vox_tone_freq << "Hz" << std::endl;
                 break;
+            case PTTType::HAMLIB:
+                std::cerr << "PTT: hamlib model " << config_.hamlib_model
+                          << " on " << config_.hamlib_device << std::endl;
+                break;
             case PTTType::COM:
                 std::cerr << "PTT: COM " << config_.com_port 
                           << " (" << PTT_LINE_OPTIONS[config_.com_ptt_line] << ")" << std::endl;
                 break;
-#ifdef WITH_CM108
             case PTTType::CM108:
+#ifdef WITH_CM108
                 std::cerr << "PTT: CM108 (GPIO" << config_.cm108_gpio << ")" << std::endl;
-                break;
+#else
+                std::cerr << "PTT: CM108 not available in this build" << std::endl;
 #endif
+                break;
         }
         
         // Start threads
@@ -593,7 +603,7 @@ private:
         if (station_id_ == 0)
             station_id_ = (uint16_t)((gen() % 0xFFFE) + 1);
         int csma_stage = 0;
-        int csma_clean = 0;
+        int64_t csma_stage_ms = 0;
         int boot_attempt = 0;
         int64_t last_burst_end = steady_now_ms() - PARTICIPATION_MS - 1;
         auto beacon_interval_ms = [&]() {
@@ -688,6 +698,11 @@ private:
                     gcfg.contenders = csma_sync_only
                                         ? n_contenders(csma_band == 0) : -1;
                     int raw_pop = gcfg.contenders;
+                    while (csma_stage > 0 &&
+                           steady_now_ms() - csma_stage_ms >= CSMA_STAGE_DECAY_MS) {
+                        csma_stage--;
+                        csma_stage_ms += CSMA_STAGE_DECAY_MS;
+                    }
                     if (occupancy_pct_.load() > 55 || csma_stage >= 1)
                         gcfg.contenders = -1;
                     if (steady_now_ms() - last_burst_end < 3000 &&
@@ -880,13 +895,11 @@ private:
                         continue;
                     }
                     if (csma_sync_only) {
-                        if (busy_episodes >= 2) {
-                            csma_stage = std::min(csma_stage + 2, 2);
-                            csma_clean = 0;
-                        } else if (busy_episodes <= 1 && ++csma_clean >= 3) {
-                            csma_clean = 0;
-                            csma_stage = std::max(csma_stage - 1, 0);
-                        }
+                        if (busy_episodes >= 2)
+                            csma_stage = 2;
+                        else if (csma_stage > 0)
+                            csma_stage--;
+                        csma_stage_ms = steady_now_ms();
                     }
                     if (!g_running)
                         break;
@@ -1053,6 +1066,20 @@ private:
 #endif
 
         // Add length prefix framing
+        bool data_oversize = false;
+        {
+            size_t cap = payload_size_;
+            if (config_.modem_type == 0 && oper_mode_override >= 0)
+                cap = encoder_->get_payload_size(oper_mode_override);
+            else if (config_.modem_type == 2 && oper_mode_override >= 0 &&
+                     oper_mode_override < ROBUST_MODE_COUNT)
+                cap = robust_encoder_->get_payload_size((RobustMode)oper_mode_override);
+            if (cap < 2 || data.size() > cap - 2) {
+                ui_log("(!) TX: " + std::to_string(data.size()) + " byte frame exceeds " +
+                       std::to_string(cap >= 2 ? cap - 2 : 0) + " byte capacity of current mode, dropped");
+                data_oversize = true;
+            }
+        }
         auto framed_data = frame_with_length(data);
 
         // Encode to audio
@@ -1085,12 +1112,13 @@ private:
             );
         }
         
+        if (data_oversize) samples.clear();
         if (samples.empty() && !beacon) {
-            ui_log("TX: Encoding failed");
+            if (!data_oversize) ui_log("TX: Encoding failed");
             if (!first && last && config_.ptt_type != PTTType::VOX) {
                 audio_->write_silence(config_.ptt_tail_ms * config_.sample_rate / 1000);
                 audio_->drain_playback();
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1100,6 +1128,7 @@ private:
                 }
             }
             if (last) {
+                tx_on_air_ = false;
                 tx_blanking_active_ = false;
 #ifdef WITH_UI
                 if (g_ui_state) g_ui_state->transmitting = false;
@@ -1203,7 +1232,7 @@ private:
             if (first) {
                 flush_ptt_reinit();
                 // PTT on (for RIGCTL or COM mode)
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1251,7 +1280,7 @@ private:
                 audio_->drain_playback();
 
                 // PTT off
-                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::COM
+                if (config_.ptt_type == PTTType::RIGCTL || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::COM
 #ifdef WITH_CM108
                     || config_.ptt_type == PTTType::CM108
 #endif
@@ -1311,7 +1340,8 @@ private:
         auto deliver_to_clients = [this](const std::vector<uint8_t>& payload, float snr, float ber_pct, bool was_reassembled,
                                          const std::string& mode = "", std::string callsign = "") {
             last_rx_done_ms_.store(steady_now_ms());
-            ui_log("RX: " + std::to_string(payload.size()) + " bytes, SNR=" +
+            ui_log("RX: " + std::to_string(payload.size()) + " bytes" +
+                   (mode.empty() ? "" : " " + mode) + ", SNR=" +
                    std::to_string((int)snr) + "dB" + (was_reassembled ? " (reassembled)" : ""));
             if (g_verbose) {
                 std::cerr << packet_visualize(payload.data(), payload.size(), false, false) << std::endl;
@@ -1715,8 +1745,25 @@ private:
                     !blanking && !g_ui_state->ptt_on.load(std::memory_order_relaxed) &&
                     !g_ui_state->transmitting.load(std::memory_order_relaxed))
                     g_ui_state->push_scope_audio(buffer.data(), n);
-                if (g_ui_state && ++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
+                if (++level_update_counter >= LEVEL_UPDATE_INTERVAL) {
                     level_update_counter = 0;
+                    {
+                        auto note = [this](int cur, int& last, const char* what) {
+                            if (cur > last && last >= 0)
+                                ui_log(std::string("RDM: ") + what + " recovered a frame");
+                            last = cur;
+                        };
+                        note(robust_decoder_->stats_backward_rescues, last_bw_, "backward rescue");
+                        note(robust_decoder_n_->stats_backward_rescues, last_bw_n_, "backward rescue");
+                        note(robust_decoder_->stats_ladder_rescues, last_ld_, "retry ladder");
+                        note(robust_decoder_n_->stats_ladder_rescues, last_ld_n_, "retry ladder");
+                        note(robust_decoder_->stats_rescues - robust_decoder_->stats_backward_rescues, last_rescues_, "tail rescue");
+                        note(robust_decoder_n_->stats_rescues - robust_decoder_n_->stats_backward_rescues, last_rescues_n_, "tail rescue");
+                        note(robust_decoder_->stats_retry_success - robust_decoder_->stats_ladder_rescues, last_retries_, "retry decode");
+                        note(robust_decoder_n_->stats_retry_success - robust_decoder_n_->stats_ladder_rescues, last_retries_n_, "retry decode");
+                    }
+                }
+                if (g_ui_state && level_update_counter == 0) {
 
                     // Copy decoder stats
                     if (g_ui_state->stats_reset_requested.exchange(false)) {
@@ -1763,6 +1810,9 @@ private:
 
     void init_ptt_driver() {
         rigctl_.reset();
+#ifdef WITH_HAMLIB
+        hamlib_ptt_.reset();
+#endif
         serial_ptt_.reset();
 #ifdef WITH_CM108
         cm108_ptt_.reset();
@@ -1780,6 +1830,20 @@ private:
                 ui_log("PTT: rigctl " + config_.rigctl_host + ":" +
                        std::to_string(config_.rigctl_port));
             }
+        } else if (config_.ptt_type == PTTType::HAMLIB) {
+#ifdef WITH_HAMLIB
+            hamlib_ptt_ = std::make_unique<HamlibPTT>();
+            std::string err;
+            if (!hamlib_ptt_->open(config_.hamlib_model, config_.hamlib_device, config_.hamlib_baud, err)) {
+                ui_log("(!) Hamlib: " + err);
+                ui_log("(!) PTT will not key the radio - check rig model and device");
+            } else {
+                ui_log("Hamlib: rig model " + std::to_string(config_.hamlib_model) + " opened on " + config_.hamlib_device);
+            }
+#else
+            dummy_ptt_ = std::make_unique<DummyPTT>();
+            dummy_ptt_->connect();
+#endif
         } else if (config_.ptt_type == PTTType::COM) {
             serial_ptt_ = std::make_unique<SerialPTT>();
             if (!serial_ptt_->open(config_.com_port,
@@ -1814,6 +1878,10 @@ private:
         bool ok = true;
         if (rigctl_) {
             ok = rigctl_->set_ptt(on);
+#ifdef WITH_HAMLIB
+        } else if (hamlib_ptt_) {
+            ok = hamlib_ptt_->set_ptt(on);
+#endif
         } else if (serial_ptt_) {
             ok = on ? serial_ptt_->ptt_on() : serial_ptt_->ptt_off();
 #ifdef WITH_CM108
@@ -1832,6 +1900,7 @@ private:
                     msg += " [" + serial_ptt_->last_error() + "]";
                 ui_log(msg);
             }
+            ptt_failed_.store(!ok);
         } else if (ok) {
             ptt_state_.store(false);
             ptt_deadline_ms_.store(0);
@@ -1849,6 +1918,7 @@ private:
 #ifdef WITH_UI
         if (g_ui_state) {
             g_ui_state->ptt_on = ptt_state_.load();
+            g_ui_state->ptt_failed = ptt_failed_.load();
         }
 #endif
         return ok;
@@ -1879,6 +1949,7 @@ private:
                           << std::endl;
                 ui_log("PTT watchdog: forcing unkey");
                 set_ptt(false);
+                tx_on_air_ = false;
             }
             int64_t reinit_at = ptt_reinit_at_ms_.load();
             if (reinit_at != 0 && steady_now_ms() >= reinit_at)
@@ -1943,6 +2014,9 @@ private:
 
     std::unique_ptr<MiniAudio> audio_;
     std::unique_ptr<RigctlPTT> rigctl_;
+#ifdef WITH_HAMLIB
+    std::unique_ptr<HamlibPTT> hamlib_ptt_;
+#endif
     std::unique_ptr<SerialPTT> serial_ptt_;
 #ifdef WITH_CM108
     std::unique_ptr<CM108PTT> cm108_ptt_;
@@ -1960,6 +2034,14 @@ private:
     std::atomic<bool> rx_running_{false};
     
     Fragmenter fragmenter_;
+    int last_rescues_ = 0;
+    int last_rescues_n_ = 0;
+    int last_retries_ = 0;
+    int last_retries_n_ = 0;
+    int last_bw_ = 0;
+    int last_bw_n_ = 0;
+    int last_ld_ = 0;
+    int last_ld_n_ = 0;
     Reassembler reassembler_;
     
     mutable std::mutex config_mutex_;
@@ -1983,6 +2065,8 @@ private:
     static constexpr int64_t HEARD_EXPIRY_MS = 300000;
     static constexpr int64_t UNATTRIB_DISTRUST_MS = 90000;
     static constexpr int RANKED_QUIET_MS = 1000;
+    // stage a decay after 60 seconds for our contention window
+    static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
     static constexpr int YIELD_BUCKETS = 4;
     static constexpr int64_t PARTICIPATION_MS = 1200000;
     int yield_attempt_ = 0;
@@ -2068,6 +2152,7 @@ private:
     mutable std::mutex ptt_mutex_;
     std::atomic<bool> ptt_state_{false};
     bool ptt_fail_logged_ = false;
+    std::atomic<bool> ptt_failed_{false};
     int ptt_unkey_retries_ = 0;
     std::atomic<int64_t> ptt_deadline_ms_{0};
     static constexpr int64_t PTT_WATCHDOG_SLACK_MS = 5000;
@@ -2082,7 +2167,7 @@ public:
     float alc_auto_tune() {
         if (alc_tune_active_.exchange(true))
             return -1.0f;
-        bool busy = tx_blanking_active_.load();
+        bool busy = tx_blanking_active_.load() || tx_on_air_.load();
 #ifdef WITH_UI
         if (g_ui_state && g_ui_state->transmitting.load())
             busy = true;
@@ -2157,6 +2242,7 @@ public:
         }
         audio_->drain_playback();
         set_ptt(false);
+        tx_on_air_ = false;
         tx_blanking_active_ = false;
         if (result > 0) {
             std::lock_guard<std::mutex> lock(config_mutex_);
@@ -2187,7 +2273,9 @@ public:
             config_.csma_responder_dither = new_config.csma_responder_dither;
             config_.csma_burst = new_config.csma_burst;
             config_.tx_lead_tone = new_config.tx_lead_tone;
-            config_.tx_blanking_enabled = new_config.tx_blanking_enabled;
+            config_.tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
+            config_.fragmentation_enabled = new_config.fragmentation_enabled;
+            config_.tx_delay_ms = new_config.tx_delay_ms;
             config_.mfsk_rx_enabled = new_config.mfsk_rx_enabled;
             config_.ofdm_rx_enabled = new_config.ofdm_rx_enabled;
             config_.robust_rx_enabled = new_config.robust_rx_enabled;
@@ -2296,6 +2384,9 @@ public:
             std::lock_guard<std::mutex> plock(ptt_mutex_);
             if (ptt_state_.load()) {
                 if (rigctl_) rigctl_->set_ptt(false);
+#ifdef WITH_HAMLIB
+                else if (hamlib_ptt_) hamlib_ptt_->set_ptt(false);
+#endif
                 else if (serial_ptt_) serial_ptt_->ptt_off();
 #ifdef WITH_CM108
                 else if (cm108_ptt_) cm108_ptt_->set_ptt(false);
@@ -2375,7 +2466,9 @@ public:
         };
     }
 
-    bool is_transmitting() const { return tx_blanking_active_.load(); }
+    bool is_transmitting() const {
+        return tx_on_air_.load() || tx_blanking_active_.load();
+    }
 
     void unkey() {
         set_ptt(false);
@@ -2407,15 +2500,34 @@ public:
         return clients_.size();
     }
 
+    bool ptt_failed() const {
+        return ptt_failed_.load();
+    }
+
     std::string rigctl_command(const std::string& cmd) {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->send_command(cmd);
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->command(cmd);
+#endif
         return "ERR: rigctl not enabled";
     }
 
     bool is_rigctl_connected() const {
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->is_connected();
+#ifdef WITH_HAMLIB
+        if (hamlib_ptt_) return hamlib_ptt_->is_connected();
+#endif
+        return false;
+    }
+
+    bool hamlib_get_freq(double& hz) {
+#ifdef WITH_HAMLIB
+        std::lock_guard<std::mutex> lock(ptt_mutex_);
+        if (hamlib_ptt_) return hamlib_ptt_->get_freq(hz);
+#endif
+        (void)hz;
         return false;
     }
     
@@ -2519,6 +2631,9 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (v >= 0 && v < ROBUST_MODE_COUNT) config.robust_mode = v;
         }
         else if (!strcmp(key, "perf_log") && take(key)) config.perf_log = atoi(value) != 0;
+        else if (!strcmp(key, "hamlib_model") && take(key)) config.hamlib_model = atoi(value);
+        else if (!strcmp(key, "hamlib_device") && take(key)) config.hamlib_device = value;
+        else if (!strcmp(key, "hamlib_baud") && take(key)) config.hamlib_baud = atoi(value);
         else if (!strcmp(key, "modulation") && take(key)) {
             int idx = atoi(value);
             if (idx >= 0 && idx < N_MOD) config.modulation = MOD_OPTS[idx];
@@ -2556,10 +2671,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "tx_lead_tone") && take(key)) config.tx_lead_tone = atoi(value) != 0;
         else if (!strcmp(key, "p_persistence") && take(key)) config.p_persistence = atoi(value);
         else if (!strcmp(key, "fragmentation_enabled") && take(key)) config.fragmentation_enabled = atoi(value) != 0;
-        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) {
-            config.tx_blanking_enabled = atoi(value) != 0;
-            g_tx_blanking_configured = true;
-        }
+        else if (!strcmp(key, "tx_blanking_enabled") && take(key)) config.tx_blanking_enabled = atoi(value) != 0;
         else if (!strcmp(key, "tx_drive") && take(key)) {
             float v = (float)atof(value);
             if (std::isfinite(v) && v >= 0.05f && v <= 1.0f) config.tx_drive = v;
@@ -2570,7 +2682,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
             if (take("audio_input")) config.audio_input_device = value;
             if (take("audio_output")) config.audio_output_device = value;
         }
-        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(atoi(value));
+        else if (!strcmp(key, "ptt_type") && take(key)) config.ptt_type = static_cast<PTTType>(ptt_type_available(atoi(value)));
         else if (!strcmp(key, "vox_tone_freq") && take(key)) {
             int v = atoi(value);
             if (v >= 300 && v <= 3000) config.vox_tone_freq = v;
@@ -2717,10 +2829,18 @@ void print_help(const char* prog) {
 #ifdef WITH_CM108
               << ", cm108"
 #endif
+#ifdef WITH_HAMLIB
+              << ", hamlib"
+#endif
               << " (default: rigctl)\n"
               << "      --rigctl HOST:PORT  Rigctld address (default: localhost:4532,\n"
               << "                          implies --ptt rigctl)\n"
               << "      --com-port PORT     Serial port for COM PTT (default: COM1)\n"
+#ifdef WITH_HAMLIB
+              << "      --hamlib-model N    Hamlib rig model number for HAMLIB PTT\n"
+              << "      --hamlib-device DEV Serial port or host:port for HAMLIB PTT\n"
+              << "      --hamlib-baud BAUD  Serial speed for HAMLIB PTT (0 = rig default)\n"
+#endif
               << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
               << "      --vox-freq HZ       VOX tone frequency (default: 1200)\n"
@@ -2759,8 +2879,8 @@ void print_help(const char* prog) {
               << "      --frag              Enable packet fragmentation/reassembly\n"
               << "      --no-frag           Disable fragmentation (default)\n"
               << "\nTX blanking:\n"
-              << "      --tx-blank          Suppress the decoder during TX\n"
-              << "      --no-tx-blank       Disable TX blanking (default)\n"
+              << "      --tx-blank          Suppress the decoder during TX (default always on with CSMA)\n"
+              << "      --no-tx-blank       Disable TX blanking (only takes effect with --no-csma)\n"
               << "\nSettings are saved to %APPDATA%\\modem73\\settings\n";
 }
 
@@ -2946,6 +3066,15 @@ int main(int argc, char** argv) {
             } else {
                 config.rigctl_host = hostport;
             }
+        } else if (arg == "--hamlib-model" && i + 1 < argc) {
+            config.hamlib_model = atoi(argv[++i]);
+            cli_set.insert("hamlib_model");
+        } else if (arg == "--hamlib-device" && i + 1 < argc) {
+            config.hamlib_device = argv[++i];
+            cli_set.insert("hamlib_device");
+        } else if (arg == "--hamlib-baud" && i + 1 < argc) {
+            config.hamlib_baud = atoi(argv[++i]);
+            cli_set.insert("hamlib_baud");
         } else if (arg == "--com-port" && i + 1 < argc) {
             config.com_port = argv[++i];
             cli_set.insert("com_port");
@@ -2993,10 +3122,16 @@ int main(int argc, char** argv) {
 #ifdef WITH_CM108
             else if (ptt_type == "cm108") config.ptt_type = PTTType::CM108;
 #endif
+#ifdef WITH_HAMLIB
+            else if (ptt_type == "hamlib") config.ptt_type = PTTType::HAMLIB;
+#endif
             else {
                 std::cerr << "Unknown PTT type: " << ptt_type << " (use none, rigctl, vox, com"
 #ifdef WITH_CM108
                           << ", cm108"
+#endif
+#ifdef WITH_HAMLIB
+                          << ", hamlib"
 #endif
                           << ")\n";
                 return 1;
@@ -3154,20 +3289,25 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    if (!g_use_ui && cli_config && !config.config_file.empty()) {
-        if (apply_settings_file(config.config_file, config, cli_set)) {
-            std::cerr << "Loaded settings from " << config.config_file << std::endl;
+    if (!g_use_ui) {
+        std::string settings_path;
+        if (cli_config && !config.config_file.empty()) {
+            settings_path = config.config_file;
         } else {
-            std::cerr << "Could not read config file: " << config.config_file << std::endl;
+            const char* appdata = getenv("APPDATA");
+            if (appdata) settings_path = std::string(appdata) + "\\modem73\\settings";
+        }
+        if (!settings_path.empty()) {
+            if (apply_settings_file(settings_path, config, cli_set)) {
+                std::cerr << "Loaded settings from " << settings_path << std::endl;
+            } else if (cli_config) {
+                std::cerr << "Could not read config file: " << settings_path << std::endl;
+            }
         }
     }
 
-    if (!g_use_ui && config.csma_enabled && !config.tx_blanking_enabled &&
-        !g_tx_blanking_configured && !cli_set.count("tx_blanking_enabled")) {
+    if (config.csma_enabled)
         config.tx_blanking_enabled = true;
-        std::cerr << "TX blanking enable "
-                  << std::endl;
-    }
 
 #ifdef WITH_UI
     TNCUIState ui_state;
@@ -3257,17 +3397,6 @@ int main(int argc, char** argv) {
                     config.fragmentation_enabled = ui_state.fragmentation_enabled;
                 if (!cli_set.count("tx_blanking_enabled"))
                     config.tx_blanking_enabled = ui_state.tx_blanking_enabled;
-                if (!ui_state.tx_blanking_auto && config.csma_enabled &&
-                    !cli_set.count("tx_blanking_enabled")) {
-                    if (!config.tx_blanking_enabled) {
-                        config.tx_blanking_enabled = true;
-                        ui_state.tx_blanking_enabled = true;
-                        std::cerr << "TX blanking enabled "
-                                  << std::endl;
-                    }
-                    ui_state.tx_blanking_auto = 1;
-                    ui_state.save_settings();
-                }
                 if (!cli_set.count("ofdm_rx_enabled"))
                     config.ofdm_rx_enabled = ui_state.ofdm_rx_enabled;
                 if (!cli_set.count("robust_rx_enabled"))
@@ -3319,6 +3448,12 @@ int main(int argc, char** argv) {
                 // COM PTT settings
                 if (!cli_set.count("com_port"))
                     config.com_port = ui_state.com_port;
+                if (!cli_set.count("hamlib_model"))
+                    config.hamlib_model = ui_state.hamlib_model;
+                if (!cli_set.count("hamlib_device"))
+                    config.hamlib_device = ui_state.hamlib_device;
+                if (!cli_set.count("hamlib_baud"))
+                    config.hamlib_baud = ui_state.hamlib_baud;
                 if (!cli_set.count("com_ptt_line"))
                     config.com_ptt_line = ui_state.com_ptt_line;
                 if (!cli_set.count("com_invert_dtr"))
@@ -3402,6 +3537,9 @@ int main(int argc, char** argv) {
                 ui_state.beacon_interval_s = config.beacon_interval_s;
                 // COM PTT settings
                 ui_state.com_port = config.com_port;
+                ui_state.hamlib_model = config.hamlib_model;
+                ui_state.hamlib_device = config.hamlib_device;
+                ui_state.hamlib_baud = config.hamlib_baud;
                 ui_state.com_ptt_line = config.com_ptt_line;
                 ui_state.com_invert_dtr = config.com_invert_dtr;
                 ui_state.com_invert_rts = config.com_invert_rts;
@@ -3458,6 +3596,9 @@ int main(int argc, char** argv) {
         ui_state.audio_input_device = config.audio_input_device;
         ui_state.audio_output_device = config.audio_output_device;
         ui_state.com_port = config.com_port;
+        ui_state.hamlib_model = config.hamlib_model;
+        ui_state.hamlib_device = config.hamlib_device;
+        ui_state.hamlib_baud = config.hamlib_baud;
         ui_state.com_ptt_line = config.com_ptt_line;
         ui_state.com_invert_dtr = config.com_invert_dtr;
         ui_state.com_invert_rts = config.com_invert_rts;
@@ -3610,9 +3751,17 @@ int main(int argc, char** argv) {
         if (config.control_port > 0) {
             ControlPort::TNCInterface ctrl_iface;
 
-            ctrl_iface.get_status = [&tnc]() -> cJSON* {
+            ctrl_iface.get_status = [&tnc, &ui_state]() -> cJSON* {
                 cJSON* j = cJSON_CreateObject();
                 auto stats = tnc.get_decoder_stats();
+                {
+                    TNCConfig c = tnc.get_config();
+                    cJSON_AddNumberToObject(j, "net_bps_estimate",
+                        net_bps_estimate(c.csma_enabled, c.csma_quiet_ms, c.csma_cw,
+                                         c.slot_time_ms, c.csma_burst, c.tx_lead_tone,
+                                         c.tx_delay_ms, ui_state.airtime_seconds,
+                                         ui_state.mtu_bytes));
+                }
 
                 // Channel state
                 const char* state = "idle";
@@ -3788,7 +3937,7 @@ int main(int argc, char** argv) {
                     g_ui_state->p_persistence = new_config.p_persistence;
                     g_ui_state->tx_drive = applied.tx_drive;
                     g_ui_state->slot_time_ms = new_config.slot_time_ms;
-                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled;
+                    g_ui_state->tx_blanking_enabled = new_config.tx_blanking_enabled || new_config.csma_enabled;
                     g_ui_state->fragmentation_enabled = new_config.fragmentation_enabled;
                     g_ui_state->ofdm_rx_enabled = new_config.ofdm_rx_enabled;
                     g_ui_state->robust_rx_enabled = new_config.robust_rx_enabled;
@@ -3882,6 +4031,9 @@ int main(int argc, char** argv) {
                 new_config.beacon_interval_s = state.beacon_interval_s;
                 // COM PTT settings
                 new_config.com_port = state.com_port;
+                new_config.hamlib_model = state.hamlib_model;
+                new_config.hamlib_device = state.hamlib_device;
+                new_config.hamlib_baud = state.hamlib_baud;
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;

@@ -6,9 +6,16 @@ WINDRES = x86_64-w64-mingw32-windres
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra
 
 GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
-BASE_VERSION := 2.3.1
+BASE_VERSION := 2.3.8
 VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(BASE_VERSION))
 CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
+
+# Numeric version parts for the Windows VERSIONINFO resource
+# (strips any -suffix, e.g. "0.1.0-dev" -> 0 1 0)
+VER_NUM := $(subst ., ,$(firstword $(subst -, ,$(VERSION))))
+VER_MAJOR := $(or $(word 1,$(VER_NUM)),0)
+VER_MINOR := $(or $(word 2,$(VER_NUM)),0)
+VER_PATCH := $(or $(word 3,$(VER_NUM)),0)
 LDFLAGS = -static -lws2_32 -lsetupapi
 
 # dependencies
@@ -22,7 +29,22 @@ INCLUDES = -I$(AICODIX_DSP) -I$(AICODIX_CODE) -I$(MODEM_SRC) -I$(PDCURSES)
 TARGET = modem73.exe
 
 SRCS = kiss_tnc.cc
-HDRS = kiss_tnc.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh serial_ptt.hh cm108_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
+
+# Optional direct Hamlib PTT: run ./build-hamlib-win.sh to produce deps/hamlib,
+# the build picks it up automatically
+ifneq ($(wildcard deps/hamlib/lib/libhamlib.a),)
+    $(info Hamlib PTT support: enabled (found deps/hamlib))
+    HAMLIB_FLAGS = -DWITH_HAMLIB
+    HAMLIB_INC = -Ideps/hamlib/include
+    HAMLIB_LIBS = deps/hamlib/lib/libhamlib.a -liphlpapi -lpthread
+    SRCS += hamlib_ptt.cc
+else
+    $(info Hamlib PTT support: disabled (run ./build-hamlib-win.sh to enable))
+    HAMLIB_FLAGS =
+    HAMLIB_INC =
+    HAMLIB_LIBS =
+endif
+HDRS = kiss_tnc.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh serial_ptt.hh cm108_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
 
 PDC_FLAGS = -DPDC_WIDE -DPDC_FORCE_UTF8
 PDC_SRCS = $(wildcard $(PDCURSES)/pdcurses/*.c) $(wildcard $(PDCURSES)/wincon/*.c)
@@ -53,10 +75,10 @@ $(PDCURSES)/%.o: $(PDCURSES)/%.c
 	$(CC) -c -O2 $(PDC_FLAGS) -I$(PDCURSES) -o $@ $<
 
 modem73_res.o: modem73.rc modem73.ico
-	$(WINDRES) modem73.rc $@
+	$(WINDRES) -DVER_MAJOR=$(VER_MAJOR) -DVER_MINOR=$(VER_MINOR) -DVER_PATCH=$(VER_PATCH) modem73.rc $@
 
 $(TARGET): $(SRCS) $(HDRS) $(OBJS)
-	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(PDC_FLAGS) $(INCLUDES) -o $@ $(SRCS) $(OBJS) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) $(UI_FLAGS) $(CM108_FLAGS) $(HAMLIB_FLAGS) $(PDC_FLAGS) $(INCLUDES) $(HAMLIB_INC) -o $@ $(SRCS) $(OBJS) $(HAMLIB_LIBS) $(LDFLAGS)
 
 clean:
 	rm -f $(TARGET) $(OBJS)
