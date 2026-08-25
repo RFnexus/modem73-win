@@ -85,11 +85,11 @@ public:
                 slot * std::uniform_int_distribution<int>(0, 3)(gen_) +
                 std::uniform_int_distribution<int>(0, slot - 1)(gen_);
         } else {
-            int slots = std::max(2, window / slot);
+            int unit = contention_unit();
+            int slots = std::max(2, window / unit);
             quiet_needed_ = cfg_.quiet_ms;
-            contention_ms_ = cfg_.extra_delay_ms + slot *
-                std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
-                std::uniform_int_distribution<int>(0, slot - 1)(gen_);
+            contention_ms_ = cfg_.extra_delay_ms + unit *
+                std::uniform_int_distribution<int>(0, slots - 1)(gen_);
         }
         contention_drawn_ = contention_ms_;
         idle_ms_ = std::min(std::max(0, cfg_.idle_credit_ms), quiet_needed_);
@@ -124,16 +124,15 @@ public:
                 contention_ms_ = cfg_.rank * rank_slot_;
             } else {
                 episodes_ = std::min(episodes_ + 1, 1);
-                int slot = std::max(1, cfg_.slot_ms);
                 int det = std::max(1, cfg_.dcd_detect_ms);
                 int w = cfg_.contenders >= 0
                     ? window_
                     : (int)std::min<long long>((long long)window_ << episodes_,
                                                32LL * (det + 150));
-                int slots = std::max(2, w / slot);
-                contention_ms_ = cfg_.extra_delay_ms + slot *
-                    std::uniform_int_distribution<int>(0, slots - 1)(gen_) +
-                    std::uniform_int_distribution<int>(0, slot - 1)(gen_);
+                int unit = contention_unit();
+                int slots = std::max(2, w / unit);
+                contention_ms_ = cfg_.extra_delay_ms + unit *
+                    std::uniform_int_distribution<int>(0, slots - 1)(gen_);
             }
             contention_drawn_ = contention_ms_;
         }
@@ -173,6 +172,13 @@ public:
     int deaf_ms() const { return deaf_ms_; }
 
 private:
+    int contention_unit() const {
+        int slot = std::max(1, cfg_.slot_ms);
+        if (!cfg_.sync_only)
+            return slot;
+        return std::max(slot, std::max(1, cfg_.dcd_detect_ms) + 150);
+    }
+
     CsmaConfig cfg_;
     std::mt19937 gen_;
     int window_ = 0;
