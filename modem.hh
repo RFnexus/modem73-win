@@ -37,6 +37,12 @@
 #ifndef PER_TONE_PRECISION
 #define PER_TONE_PRECISION 1
 #endif
+#ifndef PILOT_QUALITY_GATE
+#define PILOT_QUALITY_GATE 0.35
+#endif
+#ifndef LATE_JOIN_ALPHA
+#define LATE_JOIN_ALPHA 0.5
+#endif
 #include "bip_buffer.hh"
 #include "theil_sen.hh"
 #include "blockdc.hh"
@@ -537,6 +543,7 @@ template<typename value, typename cmplx, int rate>
 class ModemDecoder : public Common {
 public:
     char last_call_[10] = {0};
+    bool last_call_fresh_ = false;
     typedef int16_t code_type;
     typedef SIMD<code_type, 32> mesg_type;
     typedef DSP::Const<value> Const;
@@ -1113,6 +1120,7 @@ private:
                 return false;
             }
             mode = last_good_mode_;
+            last_call_fresh_ = false;
             if (!replaying_)
                 ++stats_sticky_syncs;
             std::cerr << "Decoder: Meta symbol damaged, trying last good mode " << mode << std::endl;
@@ -1135,6 +1143,7 @@ private:
             base40_decoder(call_sign, call, 9);
             call_sign[9] = 0;
             std::memcpy(last_call_, call_sign, sizeof(last_call_));
+            last_call_fresh_ = true;
             std::cerr << "Decoder: Call sign: " << call_sign << std::endl;
 
             mode = meta_info & 255;
@@ -1184,6 +1193,37 @@ private:
             CODE::XorShiftMask<int, 16, 1, 1, 14, 1> seq;
             for (int i = 1; i < len; ++i) table[i] = seq();
         }
+    }
+
+    bool erase_symbol(int j, const char* why) {
+        if (++erased_count_ > max_erased_) {
+            std::cerr << "Decoder: " << why << " at symbol " << j << ", erasure budget (" << max_erased_ << ") exhausted" << std::endl;
+            return false;
+        }
+        std::cerr << "Decoder: " << why << " at symbol " << j << ", erasing symbol" << std::endl;
+        if (!replaying_)
+            ++stats_erased_symbols;
+        erased_[j] = true;
+        snr[j] = 0;
+        saved_seed_off[j] = seed_off;
+        for (int i = 0; i < tone_count; ++i) {
+            if (i % block_length != seed_off) {
+                int bits = mod_bits;
+                if (mod_bits == 3 && k_ % 32 == 30) bits = 2;
+                if (mod_bits == 6 && k_ % 64 == 60) bits = 4;
+                if (mod_bits == 10 && k_ % 128 == 120) bits = 8;
+                if (mod_bits == 12 && k_ % 128 == 120) bits = 8;
+                for (int b = 0; b < bits; ++b)
+                    perm[k_ + b] = 0;
+                k_ += bits;
+            }
+        }
+#if CHAN_PILOT_HIST
+        for (int i = 0; i < tone_count; ++i)
+            ++pilot_age_[i];
+#endif
+        sym_k_end_[j] = k_;
+        return true;
     }
 
     bool process_symbol(int j) {
@@ -1240,40 +1280,8 @@ private:
                 }
             }
         }
-        if (seed_value < 0) {
-            if (++erased_count_ > max_erased_) {
-                std::cerr << "Decoder: Seed damaged at symbol " << j << ", erasure budget (" << max_erased_ << ") exhausted" << std::endl;
-                return false;
-            }
-            std::cerr << "Decoder: Seed damaged at symbol " << j << ", erasing symbol" << std::endl;
-            if (!replaying_)
-                ++stats_erased_symbols;
-            erased_[j] = true;
-            snr[j] = 0;
-            saved_seed_off[j] = seed_off;
-            // Without the seed value the data tones cannot be descrambled and
-            // the pilots cannot key phase/channel updates: emit zero LLRs so
-            // the polar decoder treats this symbol as punctured, and leave
-            // chan untouched.
-            for (int i = 0; i < tone_count; ++i) {
-                if (i % block_length != seed_off) {
-                    int bits = mod_bits;
-                    if (mod_bits == 3 && k_ % 32 == 30) bits = 2;
-                    if (mod_bits == 6 && k_ % 64 == 60) bits = 4;
-                    if (mod_bits == 10 && k_ % 128 == 120) bits = 8;
-                    if (mod_bits == 12 && k_ % 128 == 120) bits = 8;
-                    for (int b = 0; b < bits; ++b)
-                        perm[k_ + b] = 0;
-                    k_ += bits;
-                }
-            }
-#if CHAN_PILOT_HIST
-            for (int i = 0; i < tone_count; ++i)
-                ++pilot_age_[i];
-#endif
-            sym_k_end_[j] = k_;
-            return true;
-        }
+        if (seed_value < 0)
+            return erase_symbol(j, "Seed damaged");
         
         hadamard_encoder(seed, seed_value);
         for (int i = 0; i < seed_tones; ++i) {
@@ -1287,6 +1295,18 @@ private:
             phase[i] = arg(demod[block_length * i + seed_off]);
         }
         tse.compute(index, phase, seed_tones);
+        if (value(PILOT_QUALITY_GATE) > 0) {
+            cmplx acc(0, 0);
+            value mag = 0;
+            for (int i = 0; i < seed_tones; ++i) {
+                cmplx d = demod[block_length * i + seed_off]
+                        * DSP::polar<value>(1, -tse(index[i]));
+                acc += d;
+                mag += abs(d);
+            }
+            if (abs(acc) < value(PILOT_QUALITY_GATE) * mag)
+                return erase_symbol(j, "Pilots incoherent");
+        }
         for (int i = 0; i < tone_count; ++i)
             demod[i] *= DSP::polar<value>(1, -tse(i + tone_off_const));
         for (int i = 0; i < tone_count; ++i) {
@@ -1585,9 +1605,20 @@ private:
         int64_t dist = 2 * symbol_len + guard_len
                      + (int64_t)(symbol_count + 1) * extended_len;
         int64_t begin = anchor - dist;
-        if (begin < 0 || begin < (int64_t)ring_count_ - (int64_t)ring_len) {
-            std::cerr << "Decoder: Postamble rescue: frame no longer buffered" << std::endl;
-            return false;
+        int64_t oldest = std::max<int64_t>(0, (int64_t)ring_count_ - (int64_t)ring_len + 1);
+        int first_j = 1;
+        if (begin < oldest) {
+            int64_t head = 2 * symbol_len + guard_len;
+            int64_t miss = oldest - begin - head;
+            first_j = miss <= 0 ? 1 : (int)((miss + extended_len - 1) / extended_len) + 1;
+            int code_len = (1 << code_order) * (repeat2 ? 2 : 1);
+            int budget = (symbol_count * (code_len - data_bits - 32) * 3) / (code_len * 4);
+            if (first_j - 1 > budget) {
+                std::cerr << "Decoder: Postamble rescue: frame no longer buffered" << std::endl;
+                return false;
+            }
+            std::cerr << "Decoder: Postamble rescue: late join, " << first_j - 1
+                      << " head symbols missing" << std::endl;
         }
         if (last_decode_abs_ > 0 &&
             (int64_t)ring_count_ - (int64_t)last_decode_abs_ < dist + 2 * extended_len) {
@@ -1600,7 +1631,8 @@ private:
         int64_t total = dist + 2 * symbol_len + extended_len;
         frame_raw_.resize((size_t)total);
         for (int64_t i = 0; i < total; ++i)
-            frame_raw_[(size_t)i] = ring_[(size_t)((begin + i) % (int64_t)ring_len)];
+            frame_raw_[(size_t)i] = begin + i < oldest ? cmplx(0, 0)
+                : ring_[(size_t)((begin + i) % (int64_t)ring_len)];
 
         int save_pos = symbol_pos;
         int save_good = last_good_mode_;
@@ -1613,7 +1645,7 @@ private:
         buf_ = frame_raw_.data();
         delete seq1_ptr;
         seq1_ptr = new CODE::MLS(mls1_poly);
-        if (process_preamble() && oper_mode == mode) {
+        if (first_j == 1 && process_preamble() && oper_mode == mode) {
             bool bad = false;
             for (int j = 1; j <= symbol_count; ++j) {
                 buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
@@ -1642,9 +1674,17 @@ private:
                 erased_count_ = 0;
                 int code_len = (1 << code_order) * (repeat2 ? 2 : 1);
                 max_erased_ = (symbol_count * (code_len - data_bits - 32) * 3) / (code_len * 4);
-                forced_alpha_ = 1;
+                forced_alpha_ = first_j > 1 ? value(LATE_JOIN_ALPHA) : value(1);
                 bool bad = false;
                 for (int j = 1; j <= symbol_count; ++j) {
+                    if (j < first_j) {
+                        seed_off = (block_skew * j + first_seed) % block_length;
+                        sym_k_start_[j] = k_;
+                        for (int i = seed_off; i < tone_count; i += block_length)
+                            (*seq1_ptr)();
+                        if (!erase_symbol(j, "Missing")) { bad = true; break; }
+                        continue;
+                    }
                     buf_ = frame_raw_.data() + 2 * symbol_len + guard_len
                          + (size_t)j * extended_len;
                     if (!process_symbol(j)) { bad = true; break; }
