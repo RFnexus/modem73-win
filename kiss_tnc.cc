@@ -72,6 +72,29 @@ void signal_handler(int /*sig*/) {
     g_running = false;
 }
 
+std::atomic<bool> g_exit_done{false};
+std::mutex g_unkey_mutex;
+std::function<void()> g_unkey;
+
+static void console_unkey() {
+    std::lock_guard<std::mutex> lock(g_unkey_mutex);
+    if (g_unkey) g_unkey();
+}
+
+static BOOL WINAPI console_ctrl_handler(DWORD type) {
+    if (type == CTRL_C_EVENT)
+        return FALSE;
+    g_running = false;
+    if (type == CTRL_BREAK_EVENT)
+        return TRUE;
+    console_unkey();
+    for (int i = 0; i < 30 && !g_exit_done.load(); ++i)
+        Sleep(100);
+    if (!g_exit_done.load())
+        console_unkey();
+    return TRUE;
+}
+
 
 
 inline void ui_log(const std::string& msg) {
@@ -295,6 +318,22 @@ public:
         
         // Initialize PTT based on ptt_type
         init_ptt_driver();
+#ifdef WITH_HAMLIB
+        if (config_.hamlib_info && !hamlib_ptt_ && config_.ptt_type != PTTType::RIGCTL) {
+            if (config_.ptt_type == PTTType::COM && same_serial_port(config_.hamlib_device, config_.com_port)) {
+                ui_log("(!) Hamlib rig info: " + config_.hamlib_device + " is already used by COM PTT, use a separate port");
+            } else {
+                auto info = std::make_unique<HamlibPTT>();
+                std::string err;
+                if (!info->open(config_.hamlib_model, config_.hamlib_device, config_.hamlib_baud, err))
+                    ui_log("(!) Hamlib rig info: " + err);
+                else
+                    ui_log("Hamlib: rig info from model " + std::to_string(config_.hamlib_model) + " on " + config_.hamlib_device);
+                std::lock_guard<std::mutex> lock(ptt_mutex_);
+                hamlib_info_ = std::move(info);
+            }
+        }
+#endif
 
         server_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (server_fd_ == INVALID_SOCKET) {
@@ -1693,19 +1732,17 @@ private:
                         tone_run_start_ms_ = -1;
                         was_blanking = false;
                     }
-                    bool mfsk_rx = config_.mfsk_rx_enabled || config_.modem_type == 1;
-                    bool ofdm_rx = config_.ofdm_rx_enabled || config_.modem_type == 0;
-                    bool robust_rx = config_.robust_rx_enabled || config_.modem_type == 2;
-                    if (ofdm_rx)
-                        decoder_->process(buffer.data(), n, frame_callback);
-                    if (mfsk_rx)
-                        for (int i = 0; i < 3; ++i)
-                            mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
-                    if (robust_rx) {
-                        robust_decoder_->process(buffer.data(), n, robust_frame_callback);
-                        robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
+                    bool mfsk_rx, ofdm_rx, robust_rx, enhanced_retry, sync_only;
+                    {
+                        std::lock_guard<std::mutex> lock(config_mutex_);
+                        mfsk_rx = config_.mfsk_rx_enabled || config_.modem_type == 1;
+                        ofdm_rx = config_.ofdm_rx_enabled || config_.modem_type == 0;
+                        robust_rx = config_.robust_rx_enabled || config_.modem_type == 2;
+                        enhanced_retry = config_.robust_enhanced_retry;
+                        sync_only = config_.csma_sync_only;
                     }
-
+                    robust_decoder_->set_enhanced_retry(enhanced_retry);
+                    robust_decoder_n_->set_enhanced_retry(enhanced_retry);
                     bool on_air = tx_on_air_.load();
                     if (!on_air) {
                         if (was_on_air)
@@ -1760,13 +1797,26 @@ private:
                         tone_run_start_ms_ = -1;
                     }
 
+                    if (sync_only && tnow < tone_hold_until_ms_)
+                        set_tx_lockout((tone_hold_until_ms_ - tnow) / 1000.0f);
+                    if (ofdm_rx)
+                        decoder_->process(buffer.data(), n, frame_callback);
+                    if (mfsk_rx)
+                        for (int i = 0; i < 3; ++i)
+                            mfsk_decoders_[i]->process(buffer.data(), n, mfsk_callbacks[i]);
+                    if (robust_rx) {
+                        robust_decoder_->process(buffer.data(), n, robust_frame_callback);
+                        robust_decoder_n_->process(buffer.data(), n, robust_n_frame_callback);
+                    }
+
+                    tnow = steady_now_ms();
                     // sync DCD: OFDM meta-validated in_frame and pilot-confirmed
                     // RDM collects only; MFSK syncs are too loose to gate TX on
                     dcd_active_ = (ofdm_rx && decoder_->in_frame()) ||
                                   (robust_rx &&
                                    (robust_decoder_->carrier_active() ||
                                     robust_decoder_n_->carrier_active())) ||
-                                  (config_.csma_sync_only &&
+                                  (sync_only &&
                                    tnow < tone_hold_until_ms_);
                     if (dcd_active_) {
                         if (tnow - last_dcd_ms_ > 1500 &&
@@ -1867,6 +1917,16 @@ private:
         rigctl_.reset();
 #ifdef WITH_HAMLIB
         hamlib_ptt_.reset();
+        if (hamlib_info_) {
+            bool shared_port = config_.ptt_type == PTTType::COM &&
+                               same_serial_port(config_.hamlib_device, config_.com_port);
+            if (shared_port)
+                ui_log("(!) Hamlib rig info: " + config_.hamlib_device + " is already used by COM PTT, use a separate port");
+            if (shared_port || config_.ptt_type == PTTType::HAMLIB || config_.ptt_type == PTTType::RIGCTL) {
+                hamlib_info_->close();
+                hamlib_info_.reset();
+            }
+        }
 #endif
         serial_ptt_.reset();
 #ifdef WITH_CM108
@@ -2071,6 +2131,20 @@ private:
     std::unique_ptr<RigctlPTT> rigctl_;
 #ifdef WITH_HAMLIB
     std::unique_ptr<HamlibPTT> hamlib_ptt_;
+    std::shared_ptr<HamlibPTT> hamlib_info_;
+    HamlibPTT* hamlib_rig() const { return hamlib_ptt_ ? hamlib_ptt_.get() : hamlib_info_.get(); }
+    static bool same_serial_port(std::string a, std::string b) {
+        auto norm = [](std::string p) {
+            if (p.rfind("\\\\.\\", 0) == 0) {
+                p = p.substr(4);
+            }
+            for (auto& c : p) {
+                c = (char)toupper((unsigned char)c);
+            }
+            return p;
+        };
+        return norm(a) == norm(b);
+    }
 #endif
     std::unique_ptr<SerialPTT> serial_ptt_;
 #ifdef WITH_CM108
@@ -2123,7 +2197,7 @@ private:
     // stage a decay after 60 seconds for our contention window
     static constexpr int64_t CSMA_STAGE_DECAY_MS = 60000;
     static constexpr int YIELD_BUCKETS = 4;
-    static constexpr int64_t PARTICIPATION_MS = 1200000;
+    static constexpr int64_t PARTICIPATION_MS = 720000;
     int yield_attempt_ = 0;
     std::map<uint16_t, int64_t> heard_ids_;
     static constexpr size_t RX_HISTORY_MAX = 256;
@@ -2575,10 +2649,19 @@ public:
     }
 
     std::string rigctl_command(const std::string& cmd) {
-        std::lock_guard<std::mutex> lock(ptt_mutex_);
-        if (rigctl_) return rigctl_->send_command(cmd);
 #ifdef WITH_HAMLIB
-        if (hamlib_ptt_) return hamlib_ptt_->command(cmd);
+        std::shared_ptr<HamlibPTT> info;
+#endif
+        {
+            std::lock_guard<std::mutex> lock(ptt_mutex_);
+            if (rigctl_) return rigctl_->send_command(cmd);
+#ifdef WITH_HAMLIB
+            if (hamlib_ptt_) return hamlib_ptt_->command(cmd);
+            info = hamlib_info_;
+#endif
+        }
+#ifdef WITH_HAMLIB
+        if (info) return info->command(cmd);
 #endif
         return "ERR: rigctl not enabled";
     }
@@ -2587,7 +2670,7 @@ public:
         std::lock_guard<std::mutex> lock(ptt_mutex_);
         if (rigctl_) return rigctl_->is_connected();
 #ifdef WITH_HAMLIB
-        if (hamlib_ptt_) return hamlib_ptt_->is_connected();
+        if (hamlib_rig()) return hamlib_rig()->is_connected();
 #endif
         return false;
     }
@@ -2595,7 +2678,7 @@ public:
     bool hamlib_get_freq(double& hz) {
 #ifdef WITH_HAMLIB
         std::lock_guard<std::mutex> lock(ptt_mutex_);
-        if (hamlib_ptt_) return hamlib_ptt_->get_freq(hz);
+        if (hamlib_rig()) return hamlib_rig()->get_freq(hz);
 #endif
         (void)hz;
         return false;
@@ -2661,6 +2744,17 @@ public:
     }
 };
 
+struct UnkeyGuard {
+    explicit UnkeyGuard(KISSTNC& tnc) {
+        std::lock_guard<std::mutex> lock(g_unkey_mutex);
+        g_unkey = [&tnc]() { tnc.unkey(); };
+    }
+    ~UnkeyGuard() {
+        std::lock_guard<std::mutex> lock(g_unkey_mutex);
+        g_unkey = nullptr;
+    }
+};
+
 static const char* const MOD_OPTS[] = {
     "BPSK", "QPSK", "8PSK", "QAM16", "QAM64", "QAM256", "QAM1024", "QAM4096"
 };
@@ -2704,6 +2798,7 @@ static bool apply_settings_file(const std::string& path, TNCConfig& config,
         else if (!strcmp(key, "hamlib_model") && take(key)) config.hamlib_model = atoi(value);
         else if (!strcmp(key, "hamlib_device") && take(key)) config.hamlib_device = value;
         else if (!strcmp(key, "hamlib_baud") && take(key)) config.hamlib_baud = atoi(value);
+        else if (!strcmp(key, "hamlib_info") && take(key)) config.hamlib_info = atoi(value) != 0;
         else if (!strcmp(key, "modulation") && take(key)) {
             int idx = atoi(value);
             if (idx >= 0 && idx < N_MOD) config.modulation = MOD_OPTS[idx];
@@ -2882,6 +2977,8 @@ void print_help(const char* prog) {
               << "      --no-postamble      Do not send a postamble (default)\n"
               << "      --mfsk-mode MODE    MFSK-8, MFSK-16, MFSK-32 or MFSK-32R\n"
               << "                          (implies --modem mfsk)\n"
+              << "      --robust-enhanced-retry     Extra ROBUST RX retries (EXPERIMENTAL, more CPU)\n"
+              << "      --no-robust-enhanced-retry  Disable extra ROBUST RX retries (default)\n"
               << "      --robust-mode MODE  RDM-1200 RDM-800 RDM-600 RDM-300 RDMN-300 RDMN-150\n"
               << "                          suffix S selects short frames (e.g. RDM-600S),\n"
               << "                          RDM-QB is the 32 B micro burst\n"
@@ -2910,6 +3007,7 @@ void print_help(const char* prog) {
               << "      --hamlib-model N    Hamlib rig model number for HAMLIB PTT\n"
               << "      --hamlib-device DEV Serial port or host:port for HAMLIB PTT\n"
               << "      --hamlib-baud BAUD  Serial speed for HAMLIB PTT (0 = rig default)\n"
+              << "      --hamlib-info       Rig status via Hamlib while PTT uses another type\n"
 #endif
               << "      --com-line LINE     COM PTT line: dtr, rts, both, -dtr, -rts, -both\n"
               << "                          (prefix '-' inverts polarity; default: rts)\n"
@@ -3145,6 +3243,9 @@ int main(int argc, char** argv) {
         } else if (arg == "--hamlib-baud" && i + 1 < argc) {
             config.hamlib_baud = atoi(argv[++i]);
             cli_set.insert("hamlib_baud");
+        } else if (arg == "--hamlib-info") {
+            config.hamlib_info = true;
+            cli_set.insert("hamlib_info");
         } else if (arg == "--com-port" && i + 1 < argc) {
             config.com_port = argv[++i];
             cli_set.insert("com_port");
@@ -3238,6 +3339,12 @@ int main(int argc, char** argv) {
         } else if (arg == "--no-ofdm-rx") {
             config.ofdm_rx_enabled = false;
             cli_set.insert("ofdm_rx_enabled");
+        } else if (arg == "--robust-enhanced-retry") {
+            config.robust_enhanced_retry = true;
+            cli_set.insert("robust_enhanced_retry");
+        } else if (arg == "--no-robust-enhanced-retry") {
+            config.robust_enhanced_retry = false;
+            cli_set.insert("robust_enhanced_retry");
         } else if (arg == "--no-robust-rx") {
             config.robust_rx_enabled = false;
             cli_set.insert("robust_rx_enabled");
@@ -3358,6 +3465,10 @@ int main(int argc, char** argv) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    struct ExitFlag {
+        ~ExitFlag() { g_exit_done = true; }
+    } exit_flag;
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
     if (!g_use_ui) {
         std::string settings_path;
@@ -3375,9 +3486,6 @@ int main(int argc, char** argv) {
             }
         }
     }
-
-    if (config.csma_enabled)
-        config.tx_blanking_enabled = true;
 
 #ifdef WITH_UI
     TNCUIState ui_state;
@@ -3524,6 +3632,8 @@ int main(int argc, char** argv) {
                     config.hamlib_device = ui_state.hamlib_device;
                 if (!cli_set.count("hamlib_baud"))
                     config.hamlib_baud = ui_state.hamlib_baud;
+                if (!cli_set.count("hamlib_info"))
+                    config.hamlib_info = ui_state.hamlib_info;
                 if (!cli_set.count("com_ptt_line"))
                     config.com_ptt_line = ui_state.com_ptt_line;
                 if (!cli_set.count("com_invert_dtr"))
@@ -3610,6 +3720,7 @@ int main(int argc, char** argv) {
                 ui_state.hamlib_model = config.hamlib_model;
                 ui_state.hamlib_device = config.hamlib_device;
                 ui_state.hamlib_baud = config.hamlib_baud;
+                ui_state.hamlib_info = config.hamlib_info;
                 ui_state.com_ptt_line = config.com_ptt_line;
                 ui_state.com_invert_dtr = config.com_invert_dtr;
                 ui_state.com_invert_rts = config.com_invert_rts;
@@ -3669,6 +3780,7 @@ int main(int argc, char** argv) {
         ui_state.hamlib_model = config.hamlib_model;
         ui_state.hamlib_device = config.hamlib_device;
         ui_state.hamlib_baud = config.hamlib_baud;
+        ui_state.hamlib_info = config.hamlib_info;
         ui_state.com_ptt_line = config.com_ptt_line;
         ui_state.com_invert_dtr = config.com_invert_dtr;
         ui_state.com_invert_rts = config.com_invert_rts;
@@ -3812,9 +3924,12 @@ int main(int argc, char** argv) {
     }
 
     config.center_freq = 1500;
+    if (config.csma_enabled)
+        config.tx_blanking_enabled = true;
 
     try {
         KISSTNC tnc(config);
+        UnkeyGuard unkey_guard(tnc);
 #ifdef WITH_UI
         const float& modem_airtime_s = ui_state.airtime_seconds;
         const int& modem_mtu_bytes = ui_state.mtu_bytes;
@@ -4115,6 +4230,7 @@ int main(int argc, char** argv) {
                 new_config.hamlib_model = state.hamlib_model;
                 new_config.hamlib_device = state.hamlib_device;
                 new_config.hamlib_baud = state.hamlib_baud;
+                new_config.hamlib_info = state.hamlib_info;
                 new_config.com_ptt_line = state.com_ptt_line;
                 new_config.com_invert_dtr = state.com_invert_dtr;
                 new_config.com_invert_rts = state.com_invert_rts;

@@ -50,7 +50,7 @@ public:
         if (n > 0) {
             response[n] = '\0';
             // rigctld returns RPRT 0 on success
-            if (strstr(response, "RPRT 0") || n == 0) {
+            if (strstr(response, "RPRT 0")) {
                 ptt_on_ = on;
                 std::cerr << "rigctl: PTT " << (on ? "ON" : "OFF") << std::endl;
                 return true;
@@ -59,9 +59,9 @@ public:
                 return false;
             }
         }
-        // temp fallback
-        ptt_on_ = on;
-        return true;
+        std::cerr << "rigctl: No PTT response, disconnecting" << std::endl;
+        disconnect_locked();
+        return false;
     }
 
     // Send an arbitrary rigctld command and return the response
@@ -166,6 +166,11 @@ private:
 
     void disconnect_locked() {
         if (sock_ != INVALID_SOCKET) {
+            if (ptt_on_) {
+                u_long nb = 1;
+                ioctlsocket(sock_, FIONBIO, &nb);
+                send(sock_, "T 0\n", 4, 0);
+            }
             closesocket(sock_);
             sock_ = INVALID_SOCKET;
         }

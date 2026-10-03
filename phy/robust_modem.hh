@@ -40,6 +40,21 @@
 #ifndef IMPULSE_BLANKER
 #define IMPULSE_BLANKER 1
 #endif
+#ifndef RDM_LLR_GAIN
+#define RDM_LLR_GAIN 8
+#endif
+#ifndef RDM_TIMING_TRACK
+#define RDM_TIMING_TRACK 1
+#endif
+#ifndef RDM_BW_PILOT_CHECK
+#define RDM_BW_PILOT_CHECK 12
+#endif
+#ifndef RDM_FIX_RESTORE
+#define RDM_FIX_RESTORE 1
+#endif
+#ifndef RDM_ALIAS_QMIN
+#define RDM_ALIAS_QMIN 0.35
+#endif
 #include "hilbert.hh"
 #include "blockdc.hh"
 #include "polar_encoder.hh"
@@ -614,6 +629,8 @@ public:
                     cand_deadline_ = -1;
                     int64_t s_fp = frame_pos_, s_au = anchor_u_, s_pp = peak_pos_;
                     int64_t s_ta = trail_anchor_;
+                    int s_off[RobustParams::NROWS_MAX + 2];
+                    std::memcpy(s_off, row_off_, sizeof(s_off));
                     value s_om = omega_;
                     int s_bu = base_use_, s_rd = rows_done_;
                     unsigned s_tm = tried_mask_;
@@ -627,6 +644,8 @@ public:
                                   << ": collect preempted (q=" << lock_q_
                                   << " over " << locked_q_
                                   << (stale ? ", stale" : "") << ")" << std::endl;
+                        int n_off[RobustParams::NROWS_MAX + 2];
+                        std::memcpy(n_off, row_off_, sizeof(n_off));
                         bool rescued = false;
                         if (s_ta >= 0) {
                             int64_t n_fp = frame_pos_, n_au = anchor_u_;
@@ -639,6 +658,20 @@ public:
                             omega_ = n_om;
                         }
                         if (!rescued && s_cf) {
+#if RDM_FIX_RESTORE
+                            int64_t n_fp = frame_pos_;
+                            value n_om = omega_;
+                            int n_bu = base_use_;
+                            frame_pos_ = s_fp;
+                            omega_ = s_om;
+                            base_use_ = s_bu;
+                            std::memcpy(row_off_, s_off, sizeof(s_off));
+                            for (int i = 0; i < s_rd; ++i) {
+                                int64_t st = row_start(i);
+                                if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
+                                    take_row(i, st);
+                            }
+#endif
                             for (int mi = 0; mi < nmodes_ && !rescued; ++mi) {
                                 RobustMode rm = modes_[mi];
                                 int nr = RobustParams::nrows(rm);
@@ -660,7 +693,13 @@ public:
                                     rescued = true;
                                 }
                             }
+#if RDM_FIX_RESTORE
+                            frame_pos_ = n_fp;
+                            omega_ = n_om;
+                            base_use_ = n_bu;
+#endif
                         }
+                        std::memcpy(row_off_, n_off, sizeof(n_off));
                         if (rescued)
                             ++stats_rescues;
                         else
@@ -675,6 +714,7 @@ public:
                         trail_anchor_ = anchor_u_;
                         trail_omega_ = omega_;
                     }
+                    std::memcpy(row_off_, s_off, sizeof(s_off));
                     frame_pos_ = s_fp; anchor_u_ = s_au; peak_pos_ = s_pp;
                     omega_ = s_om; base_use_ = s_bu;
                     rows_done_ = s_rd; tried_mask_ = s_tm;
@@ -722,6 +762,13 @@ public:
                         if (pr >= 2 && (pr + 1) % 2 == 0 &&
                             pilot_window_live(pr, w, 0.10f))
                             pilot_alive_total_ = total_in_;
+#if RDM_TIMING_TRACK
+                        else if (confirmed_ && pr >= 2 && (pr + 1) % 2 == 0 &&
+                                 pilot_alive_total_ >= 0 &&
+                                 total_in_ - pilot_alive_total_ > 48000 &&
+                                 rows_done_ >= 64 && realign_collect())
+                            pilot_alive_total_ = total_in_;
+#endif
                     }
                     if (rows_done_ == 2 * RobustParams::NS + 1 &&
                         !confirmed_ &&
@@ -783,6 +830,8 @@ public:
 
     bool debug_log = true;
 
+    void set_enhanced_retry(bool enabled) { enhanced_retry_ = enabled; }
+
     float get_last_snr() const { return last_snr_; }
     float get_last_ber() const { return last_ber_; }
     float get_ber_ema() const { return ber_ema_; }
@@ -832,6 +881,7 @@ private:
     CODE::PolarListDecoder<mesg_type, 14> polar_decoder_;
     CODE::PolarListDecoder<mesg64_type, 14> polar_decoder64_;
     CODE::PolarEncoder<int8_t> ber_encoder_;
+    bool enhanced_retry_ = false;
     CODE::CRC<uint32_t> crc_{0x8F6E37A0};
 
     static const int bpf_len = 257;
@@ -1104,7 +1154,7 @@ private:
             for (int c = 1; c < 3; ++c)
                 if (qs[c] > qs[bi])
                     bi = c;
-            if (ok && bi > 0 && qs[bi] >= value(0.35) && qs[bi] > 2 * qs[0]) {
+            if (ok && bi > 0 && qs[bi] >= value(RDM_ALIAS_QMIN) && qs[bi] > 2 * qs[0]) {
                 if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                           << ": pilot alias " << j << "/" << boff << " -> "
                           << cj[bi] << "/" << cb[bi] << " (q " << qs[0]
@@ -1120,6 +1170,7 @@ private:
             return false;
         omega_ = omega0 + boff * bin_step;
         base_use_ = base_;
+        clear_row_off();
         entry_pr_ = j + 1;
         entry_checked_ = false;
         frame_pos_ = fp;
@@ -1386,6 +1437,7 @@ private:
                   << (double)total_in_ / RobustParams::SAMPLE_RATE << "s"
                   << std::endl;
         if (best_kind == 1) {
+            clear_row_off();
             frame_pos_ = p2u + D;
             rows_done_ = 0;
             tried_mask_ = 0;
@@ -1396,8 +1448,134 @@ private:
         return best_kind;
     }
 
+    int row_off_[RobustParams::NROWS_MAX + 2] = {};
+
+    void clear_row_off() {
+        std::memset(row_off_, 0, sizeof(row_off_));
+    }
+
     int64_t row_start(int row) const {
-        return frame_pos_ + (int64_t)row * RobustParams::SYM;
+        return frame_pos_ + (int64_t)row * RobustParams::SYM + row_off_[row];
+    }
+
+    value row_cp(int row, int off) const {
+        int64_t a0 = frame_pos_ + (int64_t)row * RobustParams::SYM + off
+                   + RDM_WIN_BACK - 256;
+        if (a0 < 0 || a0 + 192 + RobustParams::NFFT > (int64_t)buf_.size())
+            return 0;
+        cmplx acc(0, 0);
+        for (int j = 0; j < 192; ++j)
+            acc = acc + buf_[a0 + RobustParams::NFFT + j] * conj(buf_[a0 + j]);
+        return abs(acc);
+    }
+
+    value pilot_coherence(int first_row, int last_row) {
+        using namespace robust_detail;
+        CODE::MLS ps(0x163, narrow_ ? 89 : 1);
+        int p0 = (first_row + RobustParams::NS - 1) / RobustParams::NS;
+        for (int i = 0; i < p0 * nc_; ++i)
+            ps();
+        cmplx s(0, 0);
+        value pwr = 0;
+        for (int p = p0; p * RobustParams::NS < last_row; ++p) {
+            int i = p * RobustParams::NS;
+            int64_t st = row_start(i);
+            cmplx d[RobustParams::NC_MAX];
+            if (st < 0 || st + RobustParams::NFFT > (int64_t)buf_.size()) {
+                for (int k = 0; k < nc_; ++k)
+                    ps();
+                continue;
+            }
+            cmplx bins[RobustParams::NC_MAX + 4];
+            window_fft(st, bins);
+            for (int k = 0; k < nc_; ++k)
+                d[k] = (value)nrz(ps()) * bins[2 + k];
+            for (int k = 0; k + 1 < nc_; ++k) {
+                s = s + d[k + 1] * conj(d[k]);
+                pwr += norm(d[k]);
+            }
+            pwr += norm(d[nc_ - 1]);
+        }
+        return abs(s) / (pwr + value(1e-9));
+    }
+
+    int block_center(int r0, int r1, bool& valid) {
+        const int ND = 61;
+        value tm[ND], best = -1, pw0 = 0;
+        for (int di = 0; di < ND; ++di) {
+            int d = (di - ND / 2) * 16;
+            cmplx acc(0, 0);
+            for (int i = r0; i < r1; ++i) {
+                int64_t a0 = row_start(i) + RDM_WIN_BACK - 256 + d;
+                if (a0 < 0 || a0 + 192 + RobustParams::NFFT > (int64_t)buf_.size())
+                    continue;
+                for (int j = 0; j < 192; ++j) {
+                    acc = acc + buf_[a0 + RobustParams::NFFT + j] * conj(buf_[a0 + j]);
+                    if (di == ND / 2)
+                        pw0 += norm(buf_[a0 + j]);
+                }
+            }
+            tm[di] = abs(acc);
+            best = std::max(best, tm[di]);
+        }
+        int lo = -1, hi = -1;
+        for (int di = 0; di < ND; ++di)
+            if (tm[di] >= value(0.9) * best) {
+                if (lo < 0)
+                    lo = di;
+                hi = di;
+            }
+        valid = lo >= 0 && best > value(0.3) * pw0 && hi - lo <= 10;
+        return lo >= 0 ? ((lo + hi) / 2 - ND / 2) * 16 : 0;
+    }
+
+    int resolve_alias(int r0, int r1, int base_off, int lvl, value* qout) {
+        int cand[2] = {lvl, lvl > 0 ? lvl - RobustParams::SYM : lvl + RobustParams::SYM};
+        int ncand = std::abs(lvl) >= 160 ? 2 : 1;
+        int saved[RobustParams::NROWS_MAX + 2];
+        std::memcpy(saved, row_off_, sizeof(saved));
+        value bq = -1;
+        int bc = lvl;
+        for (int c = 0; c < ncand; ++c) {
+            for (int i = r0; i < r1; ++i)
+                row_off_[i] = base_off + cand[c];
+            value q = pilot_coherence(r0, r1);
+            if (q > bq + (c ? value(0.05) : value(0))) {
+                bq = q;
+                bc = cand[c];
+            }
+        }
+        std::memcpy(row_off_, saved, sizeof(saved));
+        if (qout)
+            *qout = bq;
+        return bc;
+    }
+
+    bool realign_collect() {
+        int r1 = rows_done_, r0 = std::max(0, r1 - 48);
+        bool valid = false;
+        int d = block_center(r0, r1, valid);
+        if (!valid || std::abs(d) < 128)
+            return false;
+        int old_off = row_off_[r1 - 1];
+        value q = 0;
+        int use = resolve_alias(r0, r1, old_off, d, &q);
+        if (q < value(0.3))
+            return false;
+        int rs = std::max(0, r0 - 32);
+        for (int i = rs; i < r0; ++i)
+            row_off_[i] = row_cp(i, old_off + use) > row_cp(i, old_off) ? old_off + use : old_off;
+        for (int i = r0; i <= RobustParams::NROWS_MAX + 1; ++i)
+            row_off_[i] = old_off + use;
+        for (int i = rs; i < r1; ++i) {
+            int64_t st = row_start(i);
+            if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
+                take_row(i, st);
+        }
+        if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                  << ": collect realigned " << old_off << " -> " << old_off + use
+                  << " near row " << r0 << " (q " << q << ")" << std::endl;
+        return true;
     }
 
     bool pilot_sanity(int npr, float gate) {
@@ -1487,6 +1665,10 @@ private:
         bool trail_saved = false;
         if (trail_anchor_ >= 0) {
             int64_t s_fp = frame_pos_;
+#if RDM_FIX_RESTORE
+            value s_om = omega_;
+            int s_bu = base_use_;
+#endif
             anchor_u_ = trail_anchor_;
             omega_ = trail_omega_;
             saved = rescue_backward(callback);
@@ -1495,6 +1677,15 @@ private:
                 trail_saved = true;
             } else {
                 frame_pos_ = s_fp;
+#if RDM_FIX_RESTORE
+                omega_ = s_om;
+                base_use_ = s_bu;
+                for (int i = 0; i < rows_done_; ++i) {
+                    int64_t st = row_start(i);
+                    if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
+                        take_row(i, st);
+                }
+#endif
             }
             trail_anchor_ = -1;
         }
@@ -1655,6 +1846,9 @@ private:
 
     bool rescue_backward(FrameCallback callback, bool consume = true) {
         int64_t s_fp = frame_pos_;
+        int s_off[RobustParams::NROWS_MAX + 2];
+        std::memcpy(s_off, row_off_, sizeof(s_off));
+        clear_row_off();
         for (int mi = 0; mi < nmodes_; ++mi) {
             RobustMode m = modes_[mi];
             int n = RobustParams::nrows(m);
@@ -1674,6 +1868,13 @@ private:
             if (head_abs < last_decode_total_ && tail_abs > last_decode_start_)
                 continue;
             frame_pos_ = row0;
+#if RDM_BW_PILOT_CHECK
+            {
+                int w = std::min(n, 128);
+                if (pilot_coherence(n - w, n) < value(RDM_BW_PILOT_CHECK) / 100)
+                    continue;
+            }
+#endif
             if (mi == 0)
                 ++stats_sync_count;
             for (int i = 0; i < n; ++i) {
@@ -1702,11 +1903,14 @@ private:
                         buf_.clear();
                     rows_done_ = 0;
                     refresh_sums((int64_t)buf_.size() - 1);
+                } else {
+                    std::memcpy(row_off_, s_off, sizeof(s_off));
                 }
                 return true;
             }
         }
         frame_pos_ = s_fp;
+        std::memcpy(row_off_, s_off, sizeof(s_off));
         for (int i = 0; i < rows_done_; ++i) {
             int64_t st = row_start(i);
             if (st >= 0 && st + RobustParams::NFFT <= (int64_t)buf_.size())
@@ -1715,7 +1919,7 @@ private:
         return false;
     }
 
-    bool try_decode(RobustMode mode, FrameCallback callback) {
+    bool try_decode(RobustMode mode, FrameCallback callback, bool enhanced = false) {
         using namespace robust_detail;
         const int order = RobustParams::code_order(mode);
         const int cbits = RobustParams::code_bits(mode);
@@ -1730,10 +1934,13 @@ private:
         int pilot_row_of[RobustParams::NROWS_MAX];
         int npil = 0;
         value dphi = 0;
+        static thread_local value pilot_noise[RobustParams::NROWS_MAX / RobustParams::NS + 2][RobustParams::NC_MAX];
         auto rowrot = [&](int i) {
             return DSP::polar<value>(1, -dphi * (value)i / RobustParams::NS);
         };
         int64_t s_fp = frame_pos_;
+        static thread_local int s_off[RobustParams::NROWS_MAX + 2];
+        std::memcpy(s_off, row_off_, sizeof(s_off));
         bool shifted = false;
         auto retake = [&]() {
             for (int i = 0; i < nrows; ++i) {
@@ -1746,20 +1953,132 @@ private:
                 }
             }
         };
-        auto fail = [&]() {
-            if (shifted) {
-                frame_pos_ = s_fp;
-                retake();
-            }
-            return false;
-        };
         bool erased = false;
-        for (int i = 0; i < nrows && !erased; ++i) {
+#if RDM_TIMING_TRACK
+        static thread_local bool zrow[RobustParams::NROWS_MAX];
+#endif
+        for (int i = 0; i < nrows; ++i) {
             bool z = true;
             for (int k = 0; k < nc_ && z; ++k)
                 z = norm(rows_[i][k]) == 0;
-            erased = z;
+#if RDM_TIMING_TRACK
+            zrow[i] = z;
+#endif
+            erased = erased || z;
         }
+#if RDM_TIMING_TRACK
+        auto rezero = [&](const bool* keep, int bl) {
+            for (int i = 0; i < nrows; ++i)
+                if (zrow[i] && (!keep || !keep[std::min(i / bl, nrows / bl - 1)]))
+                    for (int k = 0; k < nc_; ++k)
+                        rows_[i][k] = cmplx(0, 0);
+        };
+#endif
+        auto fail = [&]() {
+            if (shifted) {
+                frame_pos_ = s_fp;
+                std::memcpy(row_off_, s_off, sizeof(s_off));
+                retake();
+#if RDM_TIMING_TRACK
+                rezero(nullptr, 1);
+#endif
+            }
+            return false;
+        };
+#if RDM_TIMING_TRACK
+        if (nrows >= 64) {
+            const int BL = 32, NBMAX = RobustParams::NROWS_MAX / 32 + 2;
+            int nb = nrows / BL;
+            int cb[NBMAX];
+            bool cv[NBMAX];
+            for (int b = 0; b < nb; ++b)
+                cb[b] = block_center(b * BL, b + 1 == nb ? nrows : (b + 1) * BL, cv[b]);
+            auto med = [&](int b0, int b1, int& cnt) {
+                int v[NBMAX], n = 0;
+                for (int b = b0; b < b1; ++b)
+                    if (cv[b])
+                        v[n++] = cb[b];
+                cnt = n;
+                if (!n)
+                    return 0;
+                std::nth_element(v, v + n / 2, v + n);
+                return v[n / 2];
+            };
+            int nvalid = 0;
+            int g = med(0, nb, nvalid);
+            if (nvalid >= 2) {
+                int maxdev = 0;
+                for (int b = 0; b < nb; ++b)
+                    if (cv[b])
+                        maxdev = std::max(maxdev, std::abs(cb[b] - g));
+                int model = 0, bs = -1, lvlL = 0, lvlR = 0;
+                double slope = 0, icpt = 0;
+                if (maxdev >= 128 && nb >= 4) {
+                    int bcost = 1 << 30;
+                    for (int sp = 1; sp < nb; ++sp) {
+                        int nl, nr;
+                        int l = med(0, sp, nl), r = med(sp, nb, nr);
+                        if (!nl || !nr)
+                            continue;
+                        int cost = 0;
+                        for (int b = 0; b < nb; ++b)
+                            if (cv[b])
+                                cost += std::abs(cb[b] - (b < sp ? l : r));
+                        if (cost < bcost) {
+                            bcost = cost; bs = sp; lvlL = l; lvlR = r;
+                        }
+                    }
+                    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+                    for (int b = 0; b < nb; ++b)
+                        if (cv[b]) {
+                            sx += b; sy += cb[b]; sxx += (double)b * b; sxy += (double)b * cb[b];
+                        }
+                    double den = nvalid * sxx - sx * sx;
+                    slope = den > 0 ? (nvalid * sxy - sx * sy) / den : 0;
+                    icpt = (sy - slope * sx) / nvalid;
+                    int lcost = 0;
+                    for (int b = 0; b < nb; ++b)
+                        if (cv[b])
+                            lcost += (int)std::lround(std::fabs(cb[b] - (icpt + slope * b)));
+                    if (bs >= 0 && std::abs(lvlR - lvlL) >= 160 && bcost <= 48 * nvalid && bcost <= lcost)
+                        model = 1;
+                    else if (lcost <= 32 * nvalid && std::fabs(slope * nb) >= 96)
+                        model = 2;
+                }
+                if (model == 1) {
+                    int split = bs * BL;
+                    int useL = resolve_alias(0, split, s_off[0], lvlL, nullptr);
+                    int useR = resolve_alias(split, nrows, s_off[nrows], lvlR, nullptr);
+                    for (int i = 0; i <= nrows; ++i)
+                        row_off_[i] = s_off[i] + (i < split ? useL : useR);
+                    for (int i = std::max(0, split - BL); i < std::min(nrows, split + BL); ++i)
+                        row_off_[i] = s_off[i] + (row_cp(i, s_off[i] + useR) > row_cp(i, s_off[i] + useL) ? useR : useL);
+                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                              << ": timing step " << useL << " -> " << useR
+                              << " at row " << split << std::endl;
+                    retake();
+                    rezero(cv, BL);
+                    shifted = true;
+                } else if (model == 2) {
+                    for (int i = 0; i <= nrows; ++i)
+                        row_off_[i] = s_off[i] + (int)std::lround(icpt + slope * ((double)i / BL));
+                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                              << ": timing drift " << row_off_[0] - s_off[0] << " -> "
+                              << row_off_[nrows] - s_off[nrows] << std::endl;
+                    retake();
+                    rezero(cv, BL);
+                    shifted = true;
+                } else if (std::abs(g) >= 32) {
+                    if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
+                              << ": timing refine " << g << std::endl;
+                    frame_pos_ += g;
+                    retake();
+                    rezero(cv, BL);
+                    shifted = true;
+                }
+            }
+        }
+#else
         if (!erased && nrows >= 64) {
             value best = -1, tmet[25], pw0 = 0;
             int lo = -1, hi = -1;
@@ -1795,6 +2114,7 @@ private:
                 shifted = true;
             }
         }
+#endif
         {
             cmplx acc(0, 0);
             value pw = 0;
@@ -1848,6 +2168,10 @@ private:
                     if (k > 0) { acc = acc + value(0.2) * flat[k - 1]; w += value(0.2); }
                     if (k + 1 < nc_) { acc = acc + value(0.2) * flat[k + 1]; w += value(0.2); }
                     chanP[npil][k] = (value(1) / w) * acc * DSP::polar<value>(1, slope * k);
+                    if (enhanced) {
+                        value scale = (k == 0 || k + 1 == nc_) ? value(0.125) : value(0.24);
+                        pilot_noise[npil][k] = norm(raw[k] - chanP[npil][k]) / scale;
+                    }
                 }
                 pilot_row_of[i] = npil;
                 ++npil;
@@ -1886,7 +2210,26 @@ private:
             static const value tw1[] = {0.25, 0.5, 0.25};
             static const value tw2[] = {0.1, 0.2, 0.4, 0.2, 0.1};
             const value* tw = R == 1 ? tw1 : tw2;
-            for (int p = 0; p < npil; ++p)
+            for (int p = 0; p < npil; ++p) {
+                value weights[5];
+                for (int d = -R; d <= R; ++d) {
+                    int q = p + d;
+                    value weight = tw[d + R];
+                    if (enhanced && q >= 0 && q < npil && q != p) {
+                        if (std::abs(row_off_[p * RobustParams::NS] - row_off_[q * RobustParams::NS]) >= 32) {
+                            weight = 0;
+                        } else {
+                            value delta = 0, noise = 0, power = 0;
+                            for (int c = 0; c < nc_; ++c) {
+                                delta += norm(chanP[p][c] - chanP[q][c]);
+                                noise += value(0.44) * (pilot_noise[p][c] + pilot_noise[q][c]);
+                                power += norm(chanP[p][c]) + norm(chanP[q][c]);
+                            }
+                            weight *= std::min(value(1), (noise + value(0.02) * power) / (delta + value(1e-12)));
+                        }
+                    }
+                    weights[d + R] = weight;
+                }
                 for (int k = 0; k < nc_; ++k) {
                     if (R == 0) {
                         chanS[p][k] = chanP[p][k];
@@ -1898,11 +2241,15 @@ private:
                         int q = p + d;
                         if (q < 0 || q >= npil)
                             continue;
-                        acc = acc + tw[d + R] * chanP[q][k];
-                        w += tw[d + R];
+                        value weight = weights[d + R];
+                        if (weight == 0)
+                            continue;
+                        acc = acc + weight * chanP[q][k];
+                        w += weight;
                     }
                     chanS[p][k] = (value(1) / w) * acc;
                 }
+            }
         };
         static thread_local value cgate[RobustParams::NROWS_MAX / RobustParams::NS + 2]
                           [RobustParams::NC_MAX];
@@ -1926,6 +2273,8 @@ private:
         for (int k = 0; k < nc_; ++k)
             cgate[npil - 1][k] = 1;
 
+        static thread_local int8_t ber_reference[1 << 15];
+        bool capture_ber = true;
         int kbit = 0;
         value snr_acc = 0, row_pwr = 0;
         int snr_rows = 0;
@@ -1991,7 +2340,24 @@ private:
                 if (cp_mean > 0)
                     prec = std::min(precision * norm(chan[k]) / cp_mean, value(1023));
                 prec *= cgate[pa][k];
+                if (enhanced) {
+                    value noise = 0, weight = 0;
+                    for (int p = std::max(0, pa - 1); p <= std::min(npil - 1, pb + 1); ++p) {
+                        value w = p == pa || p == pb ? value(2) : value(1);
+                        noise += w * pilot_noise[p][k];
+                        weight += w;
+                    }
+                    value estimate = norm(chan[k]) / (noise / weight + value(1e-12));
+                    prec = std::min(prec, estimate);
+                }
+                if (capture_ber) {
+                    if (kbit < total_bits)
+                        ber_reference[kbit] = dem[k].real() < 0 ? -1 : dem[k].real() > 0 ? 1 : 0;
+                    if (kbit + 1 < total_bits)
+                        ber_reference[kbit + 1] = dem[k].imag() < 0 ? -1 : dem[k].imag() > 0 ? 1 : 0;
+                }
                 code_type b[2];
+                prec *= value(RDM_LLR_GAIN);
                 PhaseShiftKeying<4, cmplx, code_type>::soft(b, dem[k], prec);
                 if (kbit < total_bits) perm_[kbit] = b[0];
                 if (kbit + 1 < total_bits) perm_[kbit + 1] = b[1];
@@ -2001,6 +2367,7 @@ private:
         };
         smooth(1);
         demod();
+        capture_ber = false;
         if (kbit < total_bits)
             return fail();
         if (row_pwr < value(1e-12))
@@ -2054,6 +2421,8 @@ private:
 
         combine_shuffle();
         bool decoded = scan(mesg_, polar_decoder_);
+        if (decoded && enhanced)
+            ++stats_retry_success;
         static const int alt_radius[] = {2, 0};
         for (int ai = 0; ai < 2 && !decoded; ++ai) {
             smooth(alt_radius[ai]);
@@ -2115,12 +2484,15 @@ private:
             }
         }
         if (!decoded) {
+            fail();
+            if (!enhanced && enhanced_retry_)
+                return try_decode(mode, callback, true);
             if (debug_log) std::cerr << "RDM" << (narrow_ ? "n" : "")
                       << ": decode failed " << ROBUST_MODE_NAMES[(int)mode]
                       << " est SNR=" << (snr_rows > 0
                           ? 10 * std::log10(std::max(snr_acc / snr_rows, value(0.1)))
                           : value(0)) << " dB" << std::endl;
-            return fail();
+            return false;
         }
 
         uint8_t out[RobustParams::DATA_BYTES];
@@ -2128,12 +2500,14 @@ private:
             CODE::set_le_bit(out, i, ber_mesg_[i] < 0);
 
         ber_encoder_(ber_code_, ber_mesg_, RobustParams::frozen(mode), order);
+        static thread_local int8_t ber_permuted[1 << 14];
+        shuffle_enc(ber_permuted, ber_code_, order);
         int errs = 0, counted = 0;
-        for (int i = 0; i < cbits; ++i) {
-            if (code_[i] == 0)          // punctured or erased, never received
+        for (int i = 0; i < total_bits; ++i) {
+            if (ber_reference[i] == 0)
                 continue;
             ++counted;
-            if ((code_[i] < 0) != (ber_code_[i] < 0))
+            if (ber_reference[i] != ber_permuted[poff + i % cbits])
                 ++errs;
         }
         last_ber_ = counted ? (value)errs / counted : 0;
