@@ -37,6 +37,12 @@
 #ifndef PER_TONE_PRECISION
 #define PER_TONE_PRECISION 1
 #endif
+#ifndef OFDM_LLR_GAIN
+#define OFDM_LLR_GAIN 1
+#endif
+#ifndef OFDM_TIMING_TRACK
+#define OFDM_TIMING_TRACK 0
+#endif
 #ifndef PILOT_QUALITY_GATE
 #define PILOT_QUALITY_GATE 0.35
 #endif
@@ -607,7 +613,104 @@ public:
         symbol_index_ = 0;
         samples_needed_ = 0;
         k_ = 0;
+        pending_shift_ = 0;
+        osc_lag_ = 0;
+        rescan_budget_ = 8;
     }
+
+    int pending_shift_ = 0;
+    int osc_lag_ = 0;
+    int rescan_budget_ = 8;
+
+    int seed_decode_rot(const cmplx* dm) {
+        auto clamp = [](int v) { return v < -127 ? -127 : v > 127 ? 127 : v; };
+        cmplx sq(0, 0);
+        for (int i = 0; i < seed_tones; ++i)
+            sq += dm[i] * dm[i];
+        cmplx rot = DSP::polar<value>(1, -arg(sq) / 2);
+        for (int i = 0; i < seed_tones; ++i)
+            seed[i] = clamp(std::nearbyint(127 * (dm[i] * rot).real()));
+        return hadamard_decoder(seed);
+    }
+
+    bool timing_rescan(int j, const CODE::MLS& seq_entry, const int* cands, int ncand,
+                       value floor_q, int& shift_out) {
+        --rescan_budget_;
+        int start = frame_sym_start_[j];
+        if (start < 720 || start + symbol_len + 720 > (int)frame_raw_.size())
+            return false;
+        const cmplx* base = frame_raw_.data() + start;
+        cmplx dm[seed_tones];
+        DSP::TheilSenEstimator<value, seed_tones> candidate_tse;
+        auto eval = [&](int c) -> value {
+            DSP::Phasor<cmplx> o2;
+            o2.omega(-cfo_rad);
+            for (int i = 0; i < symbol_len; ++i)
+                tdom[i] = base[c + i] * o2();
+            fwd(fdom, tdom);
+            CODE::MLS sq = seq_entry;
+            for (int k = 0; k < seed_tones; ++k) {
+                int i = seed_off + block_length * k;
+                cmplx t = fdom[bin(i + tone_off_const)];
+                t *= nrz(sq());
+                dm[k] = demod_or_erase(t, chan[i]);
+            }
+            int sv = seed_decode_rot(dm);
+            if (sv < 0)
+                return 0;
+            hadamard_encoder(seed, sv);
+            for (int k = 0; k < seed_tones; ++k) {
+                dm[k] *= seed[k];
+                index[k] = tone_off_const + block_length * k + seed_off;
+                phase[k] = arg(dm[k]);
+            }
+            candidate_tse.compute(index, phase, seed_tones);
+            cmplx acc(0, 0);
+            value mag = 0;
+            for (int k = 0; k < seed_tones; ++k) {
+                cmplx d = dm[k] * DSP::polar<value>(1, -candidate_tse(index[k]));
+                acc += d;
+                mag += abs(d);
+            }
+            return abs(acc) / (mag + value(1e-12));
+        };
+        value best_q = floor_q;
+        int best_c = 0;
+        for (int ci = 0; ci < ncand; ++ci) {
+            int c = cands[ci];
+            if (std::abs(c) < OFDM_TIMING_TRACK || std::abs(c) > 700)
+                continue;
+            value q = eval(c);
+            if (q > best_q) {
+                best_q = q;
+                best_c = c;
+            }
+        }
+        if (!best_c)
+            return false;
+        for (int step = 32; step >= 2; step /= 2) {
+            for (int pass = 0; pass < 3; ++pass) {
+                int c0 = best_c;
+                for (int dc = -step; dc <= step; dc += 2 * step) {
+                    int c = c0 + dc;
+                    if (std::abs(c) > 700 || std::abs(c) < OFDM_TIMING_TRACK)
+                        continue;
+                    value q = eval(c);
+                    if (q > best_q) {
+                        best_q = q;
+                        best_c = c;
+                    }
+                }
+                if (best_c == c0)
+                    break;
+            }
+        }
+        shift_out = best_c;
+        std::cerr << "Decoder: timing rescan at symbol " << j << " -> shift " << best_c
+                  << " (q " << best_q << ")" << std::endl;
+        return true;
+    }
+
 
     
     // Get average SNR from last successful decode
@@ -909,6 +1012,9 @@ private:
 
                 frame_raw_.assign(buf_, buf_ + buffer_len);
                 frame_symbol_pos_ = symbol_pos;
+                pending_shift_ = 0;
+                osc_lag_ = 0;
+                rescan_budget_ = 8;
                 
                 std::cerr << "Decoder: Sync found at sample " << sample_count_ << std::endl;
                 std::cerr << "Decoder: CFO = " << cfo_rad * (rate / Const::TwoPi()) << " Hz" << std::endl;
@@ -965,7 +1071,8 @@ private:
                         ++stats_retry_success;
                     reset();
                 } else {
-                    samples_needed_ = extended_len;
+                    samples_needed_ = extended_len + pending_shift_;
+                    pending_shift_ = 0;
                 }
             }
             break;
@@ -1096,7 +1203,7 @@ private:
         int k = 0;
         for (int i = 0; i < tone_count; ++i) {
             if (i % block_length != seed_off) {
-                demap_soft(perm + k, demod[i], precision, 1);
+                demap_soft(perm + k, demod[i], precision * value(OFDM_LLR_GAIN), 1);
                 k += 1;
             }
         }
@@ -1227,9 +1334,39 @@ private:
     }
 
     bool process_symbol(int j) {
+        return process_symbol_body(j, true);
+    }
+
+    bool process_symbol_body(int j, bool allow_rescan) {
         seed_off = (block_skew * j + first_seed) % block_length;
         sym_k_start_[j] = k_;
         auto clamp = [](int v) { return v < -127 ? -127 : v > 127 ? 127 : v; };
+#if OFDM_TIMING_TRACK
+        CODE::MLS seq_entry = *seq1_ptr;
+        auto rescan = [&](const int* cands, int ncand, value floor_q) -> int {
+            int c = 0;
+            if (!allow_rescan || replaying_ || rescan_budget_ <= 0 ||
+                !timing_rescan(j, seq_entry, cands, ncand, floor_q, c))
+                return 0;
+            *seq1_ptr = seq_entry;
+            k_ = sym_k_start_[j];
+            buf_ = frame_raw_.data() + frame_sym_start_[j] + c;
+            pending_shift_ += c;
+            osc_lag_ += c - extended_len;
+            frame_sym_start_[j] += c;
+            if (std::abs(c) >= 128 && j > 1 && !erased_[j - 1]) {
+                for (int b = sym_k_start_[j - 1]; b < sym_k_end_[j - 1]; ++b)
+                    perm[b] = 0;
+                erased_[j - 1] = true;
+                ++erased_count_;
+                snr[j - 1] = 0;
+                std::cerr << "Decoder: erasing symbol " << j - 1 << " across the timing step" << std::endl;
+            }
+            return c;
+        };
+#else
+        (void)allow_rescan;
+#endif
         
         // FFT the current symbol
         for (int i = 0; i < symbol_len; ++i)
@@ -1252,6 +1389,14 @@ private:
         for (int i = 0; i < seed_tones; ++i)
             seed[i] = clamp(std::nearbyint(127 * demod[i * block_length + seed_off].real()));
         int seed_value = hadamard_decoder(seed);
+#if OFDM_TIMING_TRACK
+        if (osc_lag_ && !replaying_) {
+            cmplx dm[seed_tones];
+            for (int i = 0; i < seed_tones; ++i)
+                dm[i] = demod[i * block_length + seed_off];
+            seed_value = seed_decode_rot(dm);
+        }
+#endif
         if (seed_value < 0) {
             value tp = 0, cp = 0;
             for (int i = 0; i < tone_count; ++i) {
@@ -1280,8 +1425,17 @@ private:
                 }
             }
         }
-        if (seed_value < 0)
+        if (seed_value < 0) {
+#if OFDM_TIMING_TRACK
+            int grid[80], ng = 0;
+            for (int c = -640; c <= 640; c += 16)
+                if (c)
+                    grid[ng++] = c;
+            if (rescan(grid, ng, value(0.6)))
+                return process_symbol_body(j, false);
+#endif
             return erase_symbol(j, "Seed damaged");
+        }
         
         hadamard_encoder(seed, seed_value);
         for (int i = 0; i < seed_tones; ++i) {
@@ -1304,8 +1458,36 @@ private:
                 acc += d;
                 mag += abs(d);
             }
-            if (abs(acc) < value(PILOT_QUALITY_GATE) * mag)
+            if (abs(acc) < value(PILOT_QUALITY_GATE) * mag) {
+#if OFDM_TIMING_TRACK
+                int grid[80], ng = 0;
+                for (int c = -640; c <= 640; c += 16)
+                    if (c)
+                        grid[ng++] = c;
+                if (rescan(grid, ng, value(0.6)))
+                    return process_symbol_body(j, false);
+#endif
                 return erase_symbol(j, "Pilots incoherent");
+            }
+#if OFDM_TIMING_TRACK
+            if (allow_rescan && !replaying_ && rescan_budget_ > 0) {
+                cmplx w(0, 0);
+                value wn = 0;
+                for (int k = 0; k + 1 < seed_tones; ++k) {
+                    cmplx a = demod[block_length * k + seed_off], b = demod[block_length * (k + 1) + seed_off];
+                    w += b * conj(a);
+                    wn += abs(a) * abs(b);
+                }
+                value d = arg(w) * value(symbol_len) / (Const::TwoPi() * block_length);
+                value q_now = abs(acc) / (mag + value(1e-12));
+                if (abs(w) > value(0.5) * wn && std::fabs(d) >= value(OFDM_TIMING_TRACK) / 2) {
+                    int di = (int)std::lround(d), half = symbol_len / block_length / 2;
+                    int cands[6] = {-di, di, -di - half, -di + half, di - half, di + half};
+                    if (rescan(cands, 6, std::max(value(0.5), q_now + value(0.1))))
+                        return process_symbol_body(j, false);
+                }
+            }
+#endif
         }
         for (int i = 0; i < tone_count; ++i)
             demod[i] *= DSP::polar<value>(1, -tse(i + tone_off_const));
@@ -1464,7 +1646,7 @@ private:
                 value prec = precision;
                 if (PER_TONE_PRECISION && chan_pwr_mean > 0)
                     prec = std::min(precision * norm(chan[i]) / chan_pwr_mean, value(1023));
-                demap_soft(perm + k_, demod[i], prec, bits);
+                demap_soft(perm + k_, demod[i], prec * value(OFDM_LLR_GAIN), bits);
                 k_ += bits;
             }
         }
@@ -1582,7 +1764,7 @@ private:
                     value prec = precision;
                     if (PER_TONE_PRECISION && chan_pwr_mean > 0)
                         prec = std::min(precision * norm(chan2[i]) / chan_pwr_mean, value(1023));
-                    demap_soft(perm + l, dem[i], prec, bits);
+                    demap_soft(perm + l, dem[i], prec * value(OFDM_LLR_GAIN), bits);
                     l += bits;
                 }
             }

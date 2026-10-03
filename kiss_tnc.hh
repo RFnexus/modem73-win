@@ -95,6 +95,7 @@ struct TNCConfig {
     int hamlib_model = 0;
     std::string hamlib_device;
     int hamlib_baud = 0;
+    bool hamlib_info = false;
     std::string rigctl_host = "localhost";
     int rigctl_port = 4532;
     
@@ -145,6 +146,7 @@ struct TNCConfig {
     bool mfsk_rx_enabled = true;
     bool ofdm_rx_enabled = true;
     bool robust_rx_enabled = true;
+    bool robust_enhanced_retry = false;
 
     // Fragmentation settings
     bool fragmentation_enabled = false;

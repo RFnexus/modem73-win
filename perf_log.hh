@@ -33,8 +33,7 @@ public:
     }
 
     static std::string default_path() {
-        const char* home = getenv("HOME");
-        return std::string(home ? home : ".") + "/.config/modem73/perf.csv";
+        return config_dir() + "\\perf.csv";
     }
 
     void record(const std::string& mode, float snr, float ber_pct, int bytes,
@@ -88,11 +87,7 @@ public:
         if (csv_)
             return true;
         path_ = default_path();
-        const char* home = getenv("HOME");
-        if (home) {
-            _mkdir((std::string(home) + "/.config").c_str());
-            _mkdir((std::string(home) + "/.config/modem73").c_str());
-        }
+        _mkdir(config_dir().c_str());
         static const char* header = "time,mode,snr_db,ber_pct,bytes,seq,lost_before\n";
         struct stat st;
         bool fresh = stat(path_.c_str(), &st) != 0 || st.st_size == 0;
@@ -153,6 +148,11 @@ public:
     }
 
 private:
+    static std::string config_dir() {
+        const char* appdata = getenv("APPDATA");
+        return std::string(appdata ? appdata : ".") + "\\modem73";
+    }
+
     mutable std::mutex m_;
     std::map<std::string, PerfModeStats> stats_;
     FILE* csv_ = nullptr;
