@@ -6,7 +6,7 @@ WINDRES = x86_64-w64-mingw32-windres
 CXXFLAGS = -std=c++17 -O3 -Wall -Wextra
 
 GIT_EXACT := $(shell git describe --tags --exact-match 2>/dev/null | sed 's/^v//')
-BASE_VERSION := 2.4.2
+BASE_VERSION := 2.5.0
 VERSION ?= $(if $(GIT_EXACT),$(GIT_EXACT),$(BASE_VERSION))
 CXXFLAGS += -DMODEM73_VERSION=\"$(VERSION)\"
 
@@ -44,7 +44,7 @@ else
     HAMLIB_INC =
     HAMLIB_LIBS =
 endif
-HDRS = kiss_tnc.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh rigctl_ptt.hh hamlib_ptt.hh serial_ptt.hh cm108_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh control_port.hh
+HDRS = kiss_tnc.hh kiss_tnc_impl.hh rx_frame_info.hh csma.hh tone_dcd.hh miniaudio_audio.hh net_audio.hh rigctl_ptt.hh hamlib_ptt.hh serial_ptt.hh cm108_ptt.hh modem.hh phy/mfsk_modem.hh phy/robust_modem.hh phy/common.hh tnc_ui.hh tnc_ui_state.hh glyphs.hh control_port.hh attach_client.hh probe.hh
 
 PDC_FLAGS = -DPDC_WIDE -DPDC_FORCE_UTF8
 PDC_SRCS = $(wildcard $(PDCURSES)/pdcurses/*.c) $(wildcard $(PDCURSES)/wincon/*.c)

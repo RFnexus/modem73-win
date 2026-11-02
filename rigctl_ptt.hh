@@ -35,6 +35,8 @@ public:
             if (!connect_locked()) return false;
         }
 
+        drain_stale_locked();
+
         // T 1 (PTT on) or T 0 (PTT off)
         std::string cmd = on ? "T 1\n" : "T 0\n";
 
@@ -70,6 +72,8 @@ public:
         if (!connected_) {
             if (!connect_locked()) return "ERR: not connected";
         }
+
+        drain_stale_locked();
 
         std::string wire = cmd + "\n";
         if (::send(sock_, wire.c_str(), (int)wire.length(), 0) < 0) {
@@ -162,6 +166,13 @@ private:
         connected_ = true;
         std::cerr << "rigctl: Connected to " << host_ << ":" << port_ << std::endl;
         return true;
+    }
+
+    void drain_stale_locked() {
+        char junk[256];
+        u_long avail = 0;
+        while (ioctlsocket(sock_, FIONREAD, &avail) == 0 && avail > 0 &&
+               recv(sock_, junk, sizeof(junk), 0) > 0) {}
     }
 
     void disconnect_locked() {

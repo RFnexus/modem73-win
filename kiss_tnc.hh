@@ -35,17 +35,27 @@ namespace KISS {
 }
 
 
+#if defined(__linux__) && !defined(__ANDROID__)
+#if __has_include(<linux/gpio.h>)
+#include <linux/gpio.h>
+#endif
+#ifdef GPIO_V2_GET_LINE_IOCTL
+#define WITH_GPIO_PTT 1
+#endif
+#endif
+
 enum class PTTType {
     NONE = 0,
     RIGCTL = 1,
     VOX = 2,
     COM = 3,
     CM108 = 4,
-    HAMLIB = 5
+    HAMLIB = 5,
+    GPIO = 6
 };
 
 const std::vector<std::string> PTT_TYPE_OPTIONS = {
-    "NONE", "RIGCTL", "VOX", "COM", "CM108", "HAMLIB"
+    "NONE", "RIGCTL", "VOX", "COM", "CM108", "HAMLIB", "GPIO"
 };
 
 inline int ptt_type_available(int v) {
@@ -54,6 +64,9 @@ inline int ptt_type_available(int v) {
 #endif
 #ifndef WITH_CM108
     if (v == static_cast<int>(PTTType::CM108)) return static_cast<int>(PTTType::NONE);
+#endif
+#ifndef WITH_GPIO_PTT
+    if (v == static_cast<int>(PTTType::GPIO)) return static_cast<int>(PTTType::NONE);
 #endif
     return v;
 }
@@ -73,6 +86,7 @@ struct TNCConfig {
     // Audio settings
     std::string audio_input_device = "default";
     std::string audio_output_device = "default";
+    std::string audio_backend = "auto";
     int sample_rate = 48000;
     float tx_drive = 1.0f;
     
@@ -85,6 +99,9 @@ struct TNCConfig {
     std::string modulation = "QPSK";
     std::string code_rate = "1/2";
     int frame_size = 1;         // 0=short, 1=normal, 2=long, 3=micro
+    bool frame_size_auto = false;
+    bool auto_long = false;
+    bool probe_reply = false;
     bool postamble = false;
     bool rx_filter_enabled = true;  // RX bandpass in front of the OFDM decoder
     
@@ -109,6 +126,9 @@ struct TNCConfig {
     int com_ptt_line = 1;        // 0=DTR, 1=RTS, 2=BOTH
     bool com_invert_dtr = false;
     bool com_invert_rts = false;
+    std::string gpio_chip = "gpiochip0";
+    int gpio_line = 17;
+    bool gpio_active_low = false;
 
 #ifdef WITH_CM108
     // CM108 PTT settings
