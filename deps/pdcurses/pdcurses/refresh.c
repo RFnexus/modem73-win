@@ -168,38 +168,24 @@ int doupdate(void)
                 last = curscr->_lastch[y];
             }
 
-            while (first <= last)
+            /* trim unchanged cells at both ends and flush the rest as one
+               span: one console round trip per line instead of one per
+               run of changed cells */
+
+            if (!clearall)
             {
-                int len = 0;
-
-                /* build up a run of changed cells; if two runs are
-                   separated by a single unchanged cell, ignore the
-                   break */
-
-                if (clearall)
-                    len = last - first + 1;
-                else
-                    while (first + len <= last &&
-                           (src[first + len] != dest[first + len] ||
-                            (len && first + len < last &&
-                             src[first + len + 1] != dest[first + len + 1])
-                           )
-                          )
-                        len++;
-
-                /* update the screen, and SP->lastscr */
-
-                if (len)
-                {
-                    PDC_transform_line(y, first, len, src + first);
-                    memcpy(dest + first, src + first, len * sizeof(chtype));
-                    first += len;
-                }
-
-                /* skip over runs of unchanged cells */
-
                 while (first <= last && src[first] == dest[first])
                     first++;
+                while (last >= first && src[last] == dest[last])
+                    last--;
+            }
+
+            if (first <= last)
+            {
+                int len = last - first + 1;
+
+                PDC_transform_line(y, first, len, src + first);
+                memcpy(dest + first, src + first, len * sizeof(chtype));
             }
 
             curscr->_firstch[y] = _NO_CHANGE;

@@ -30,9 +30,9 @@ void PDC_gotoyx(int row, int col)
     SetConsoleCursorPosition(pdc_con_out, coord);
 }
 
-void _set_ansi_color(short f, short b, attr_t attr)
+int _ansi_color_esc(char *esc, short f, short b, attr_t attr)
 {
-    char esc[64], *p;
+    char *p;
     short tmp, underline;
     bool italic;
 
@@ -126,13 +126,35 @@ void _set_ansi_color(short f, short b, attr_t attr)
     if (strlen(esc) > 2)
     {
         sprintf(p, "m");
-        if (!pdc_conemu)
-            SetConsoleMode(pdc_con_out, 0x0015);
+        return (int)strlen(esc);
+    }
+    esc[0] = 0;
+    return 0;
+}
 
-        WriteConsoleA(pdc_con_out, esc, strlen(esc), NULL, NULL);
+/* escape sequences need ENABLE_VIRTUAL_TERMINAL_PROCESSING; switch it on
+   once and leave it, instead of toggling it around every write */
 
-        if (!pdc_conemu)
-            SetConsoleMode(pdc_con_out, 0x0010);
+bool pdc_vt_enabled = FALSE;
+
+static void _ensure_vt(void)
+{
+    if (!pdc_vt_enabled && !pdc_conemu)
+    {
+        SetConsoleMode(pdc_con_out, 0x0015);
+        pdc_vt_enabled = TRUE;
+    }
+}
+
+void _set_ansi_color(short f, short b, attr_t attr)
+{
+    char esc[64];
+    int n = _ansi_color_esc(esc, f, b, attr);
+
+    if (n)
+    {
+        _ensure_vt();
+        WriteConsoleA(pdc_con_out, esc, n, NULL, NULL);
     }
 }
 
@@ -248,12 +270,141 @@ void _new_packet(attr_t attr, int lineno, int x, int len, const chtype *srcp)
 /* update the given physical line to look like the corresponding line in
    curscr */
 
+/* Emit a whole span with one console write (plus one mode toggle pair
+   when escape sequences are needed) instead of one or more calls per
+   attribute run; each call is a round trip to the console host. */
+
+#define PDC_BATCH_CELLS 1024
+
+static bool _batch_line(int lineno, int x, int len, const chtype *srcp)
+{
+    static CHAR_INFO ci[PDC_BATCH_CELLS];
+    static WCHAR wbuf[PDC_BATCH_CELLS + 64 * 64];
+    attr_t attr, run_attr = 0;
+    short fore = 0, back = 0;
+    bool blink = FALSE, ansi = pdc_ansi, have = FALSE;
+    WORD mapped_attr = 0;
+    int j, n = 0, runs = 0;
+
+    if (len <= 0 || len > PDC_BATCH_CELLS)
+        return FALSE;
+    if (pdc_ansi && (lineno == (SP->lines - 1)) && ((x + len) == SP->cols))
+        return FALSE;
+
+    for (j = 0; j < len; j++)
+    {
+        attr = srcp[j] & (A_ATTRIBUTES ^ A_ALTCHARSET);
+        if (!have || attr != run_attr)
+        {
+            PDC_pair_content(PAIR_NUMBER(attr), &fore, &back);
+            if (fore >= 16 || back >= 16)
+                ansi = TRUE;
+            run_attr = attr;
+            have = TRUE;
+            runs++;
+        }
+    }
+    if (runs > 64)
+        return FALSE;
+
+    have = FALSE;
+    if (ansi)
+    {
+        char esc[64];
+        int k, m = sprintf(esc, "\x1b[%d;%dH", lineno + 1, x + 1);
+        for (k = 0; k < m; k++)
+            wbuf[n++] = (WCHAR)esc[k];
+    }
+
+    for (j = 0; j < len; j++)
+    {
+        chtype ch = srcp[j];
+        attr = ch & (A_ATTRIBUTES ^ A_ALTCHARSET);
+
+        if (!have || attr != run_attr)
+        {
+            attr_t a = attr;
+            PDC_pair_content(PAIR_NUMBER(a), &fore, &back);
+            blink = (SP->termattrs & A_BLINK) && (a & A_BLINK);
+            if (blink)
+            {
+                a &= ~A_BLINK;
+                if (blinked_off)
+                    a &= ~(A_UNDERLINE | A_RIGHT | A_LEFT);
+            }
+            if (a & A_BOLD)
+                fore |= 8;
+            if (a & A_BLINK)
+                back |= 8;
+
+            if (ansi)
+            {
+                char esc[64];
+                int k, m = _ansi_color_esc(esc, fore, back, a);
+                for (k = 0; k < m; k++)
+                    wbuf[n++] = (WCHAR)esc[k];
+            }
+            else
+            {
+                short f = pdc_curstoreal[fore], b = pdc_curstoreal[back];
+                mapped_attr = (a & A_REVERSE) ? (b | (f << 4)) : (f | (b << 4));
+                if (a & A_UNDERLINE)
+                    mapped_attr |= 0x8000;
+                if (a & A_LEFT)
+                    mapped_attr |= 0x0800;
+                if (a & A_RIGHT)
+                    mapped_attr |= 0x1000;
+            }
+            run_attr = attr;
+            have = TRUE;
+        }
+
+        if (ch & A_ALTCHARSET && !(ch & 0xff80))
+            ch = acs_map[ch & 0x7f];
+        if (blink && blinked_off)
+            ch = ' ';
+
+        if (ansi)
+            wbuf[n++] = (WCHAR)(ch & A_CHARTEXT);
+        else
+        {
+            ci[j].Attributes = mapped_attr;
+            ci[j].Char.UnicodeChar = (WCHAR)(ch & A_CHARTEXT);
+        }
+    }
+
+    if (ansi)
+    {
+        _ensure_vt();
+        WriteConsoleW(pdc_con_out, wbuf, n, NULL, NULL);
+    }
+    else
+    {
+        COORD bufSize, bufPos;
+        SMALL_RECT sr;
+
+        bufPos.X = bufPos.Y = 0;
+        bufSize.X = len;
+        bufSize.Y = 1;
+        sr.Top = sr.Bottom = lineno;
+        sr.Left = x;
+        sr.Right = x + len - 1;
+        WriteConsoleOutput(pdc_con_out, ci, bufSize, bufPos, &sr);
+    }
+    return TRUE;
+}
+
 void PDC_transform_line(int lineno, int x, int len, const chtype *srcp)
 {
     attr_t old_attr, attr;
     int i, j;
 
     PDC_LOG(("PDC_transform_line() - called: lineno=%d\n", lineno));
+
+#ifdef PDC_WIDE
+    if (_batch_line(lineno, x, len, srcp))
+        return;
+#endif
 
     old_attr = *srcp & (A_ATTRIBUTES ^ A_ALTCHARSET);
 
