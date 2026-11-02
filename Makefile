@@ -16,7 +16,7 @@ VER_NUM := $(subst ., ,$(firstword $(subst -, ,$(VERSION))))
 VER_MAJOR := $(or $(word 1,$(VER_NUM)),0)
 VER_MINOR := $(or $(word 2,$(VER_NUM)),0)
 VER_PATCH := $(or $(word 3,$(VER_NUM)),0)
-LDFLAGS = -static -lws2_32 -lsetupapi
+LDFLAGS = -static -lws2_32 -lsetupapi -lwinmm
 
 # dependencies
 AICODIX_DSP ?= deps/aicodix/dsp

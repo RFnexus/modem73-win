@@ -1,6 +1,7 @@
 #pragma once
 
 #include <locale.h>
+#include <mmsystem.h>
 #define PDC_NCMOUSE
 #include <curses.h>
 #undef A_DIM
@@ -175,6 +176,7 @@ public:
             _close(devnull);
         }
         
+        timeBeginPeriod(1);
         initscr();
         initialized_ = true;
         cbreak();
@@ -222,6 +224,7 @@ public:
         
         running_ = true;
         
+        auto next_frame = std::chrono::steady_clock::now();
         while (running_ && g_running) {
             int ch = getch();
             if (handle_resize(ch)) {
@@ -251,10 +254,14 @@ public:
             if (restart_dialog_)
                 draw_restart_dialog();
             refresh();
-            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+            next_frame += std::chrono::milliseconds(33);
+            auto now = std::chrono::steady_clock::now();
+            if (next_frame < now) next_frame = now;
+            std::this_thread::sleep_until(next_frame);
         }
         
         endwin();
+        timeEndPeriod(1);
         initialized_ = false;
         
 
@@ -412,10 +419,14 @@ private:
     }
 
     bool poll_resize() {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_resize_poll_ < std::chrono::milliseconds(250)) return false;
+        last_resize_poll_ = now;
         return adopt_console_size("viewport poll");
     }
 
     bool pdc_viewport_live_ = false;
+    std::chrono::steady_clock::time_point last_resize_poll_{};
 
     void handle_input(int ch) {
         if (restart_dialog_) {

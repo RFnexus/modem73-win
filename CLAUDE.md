@@ -38,6 +38,7 @@ Single-binary C++17 project; the only compilation unit is `kiss_tnc.cc`, everyth
 - Config/settings/presets/appearance/perf log live in `%APPDATA%\modem73\` (was `~/.config/modem73`).
 - Restart (MISC, NETWORK tab, control port `restart`) relaunches the exe with `CreateProcess` using the original command line and waits for the child, since Windows has no in-place `exec`.
 - Ctrl+C/close go through a console control handler that unkeys the radio; the Windows port also re-initialises the PTT driver live when PTT settings change (upstream requires a restart).
+- `deps/pdcurses` is patched for console throughput: `doupdate` (`pdcurses/refresh.c`) flushes each dirty line as one span and the wincon backend (`wincon/pdcdisp.c`, `_batch_line`) emits a line with a single `WriteConsoleOutput` or one VT string, with virtual terminal processing enabled once. Re-apply these when updating PDCurses. The TUI also runs with `timeBeginPeriod(1)`, paces frames against a steady-clock deadline and polls the console viewport for resizes at most four times a second.
 - `windows.h` defines `IN`/`OUT` macros that clash with aicodix template parameters — `kiss_tnc_impl.hh` `#undef`s them after the network includes; keep that ordering.
 
 Parity with upstream is a three-way merge per file: base = upstream at the last parity commit, ours = this tree, theirs = upstream HEAD. Files with no Windows delta (`csma.hh`, `modem.hh`, `phy/*`, `rx_frame_info.hh`, `probe.hh`, `glyphs.hh`) are copied verbatim.
